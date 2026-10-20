@@ -1,0 +1,18 @@
+/* Example only: adapt device, unit and geometry to a disposable partition. */
+FFSTEST:
+ FileSystem = L:FastFileSystem
+ ForceLoad = 1
+ Device = uaehf.device
+ Unit = 1
+ Surfaces = 2
+ BlocksPerTrack = 11
+ Reserved = 2
+ LowCyl = 0
+ HighCyl = 79
+ BlockSize = 512
+ StackSize = 32768
+ Buffers = 32
+ GlobVec = -1
+ DosType = 0x444f5301
+ Activate = 1
+#
