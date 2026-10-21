@@ -2240,8 +2240,20 @@ static int write_fast_impl(struct ffs_volume *v, struct ffs_file_state *state,
     if (state && state->key == key && state->generation == v->generation &&
         state->table_start && state->table_start <= first) {
         table_start = state->table_start; current = state->table;
-        err = write_table(v, key, current, &table);
     }
+    /* Tables before the first written block stay unchanged. Walking them as
+     * views keeps a write deep into a large file from holding the chain. */
+    if (first - table_start >= v->buckets) {
+        struct block_view view = {0};
+        const unsigned char *p = head->bytes;
+        if (current != key) { err = table_view(v, current, key, &view); p = view.bytes; }
+        while (!err && first - table_start >= v->buckets && (next = word(p, size - 8))) {
+            err = table_view(v, next, key, &view);
+            p = view.bytes; current = next; table_start += v->buckets;
+        }
+        release_view(v, &view);
+    }
+    if (!err && current != key) err = write_table(v, key, current, &table);
     if (!err) err = prepare_write_tables(v, &allocator, &plan, key, old_count,
                                          last, table_start, table);
     if (err) goto done;
