@@ -677,26 +677,32 @@ static int table_view(struct ffs_volume *v, uint32_t key, uint32_t file,
 int ffs_read(struct ffs_volume *v, uint32_t key, uint32_t offset, void *data,
              uint32_t length, uint32_t *actual)
 {
-    struct ffs_entry e;
     struct block_view table, payload = {0};
     const unsigned char *p, *block;
-    unsigned char *out = data;
-    uint32_t capacity;
-    uint32_t index, skip, extension, seen = 0, n, amount, data_key;
+    unsigned char *out = data, *transfer = NULL;
+    uint32_t capacity, transfer_blocks = 0, size;
+    uint32_t index, within, skip, extension, seen = 0, n, amount, data_key;
+    unsigned extent;
     int err;
     *actual = 0;
     if (!v || !v->mounted) return FFS_CORRUPT;
     capacity = v->block_size - (v->format.fast ? 0 : 24);
     err = header_view(v, key, &table);
     p = table.bytes;
-    if (!err) err = decode_entry(v, key, p, &e);
+    /* Validate the header; a read needs only its type, protection and size. */
+    if (!err) err = decode_entry(v, key, p, NULL);
     if (err) goto done;
-    if (e.type != -3) { err = FFS_WRONG_TYPE; goto done; }
-    if (e.protection & 8) { err = FFS_READ_PROTECTED; goto done; }
-    if (offset >= e.size || !length) goto done;
+    if (word(p, v->block_size - 4) != UINT32_C(0xfffffffd)) { err = FFS_WRONG_TYPE; goto done; }
+    if (word(p, v->block_size - 192) & 8) { err = FFS_READ_PROTECTED; goto done; }
+    size = word(p, v->block_size - 188);
+    if (offset >= size || !length) goto done;
     if (!data) { err = FFS_BAD_NAME; goto done; }
-    if (length > e.size - offset) length = e.size - offset;
-    index = offset / capacity; skip = index / v->buckets;
+    if (length > size - offset) length = size - offset;
+    /* FFS blocks hold a power of two bytes; only OFS needs the division. */
+    if (v->format.fast) { index = offset >> v->block_shift; within = offset & (capacity - 1); }
+    else { index = offset / capacity; within = offset % capacity; }
+    skip = 0; n = index;
+    if (n >= v->buckets) { skip = index / v->buckets; n = index - skip * v->buckets; }
     if (v->read_file == key && v->read_index && v->read_index <= skip) {
         extension = v->read_table;
         err = table_view(v, extension, key, &table);
@@ -715,37 +721,67 @@ int ffs_read(struct ffs_volume *v, uint32_t key, uint32_t offset, void *data,
         v->read_file = key; v->read_index = seen;
         v->read_table = seen ? word(p, 4) : key;
     }
-    n = index % v->buckets;
     while (!err && length) {
         if (n >= word(p, 8) || word(p, 8) > v->buckets) { err = FFS_CORRUPT; break; }
         data_key = word(p, 24 + (v->buckets - 1 - n) * 4);
         if (!valid_key(v, data_key)) { err = FFS_CORRUPT; break; }
-        if (v->format.fast && v->io.read_extent && !v->changes &&
-            !v->pending && offset % capacity == 0 && length >= capacity) {
-            uint32_t run = 1, limit = length / capacity;
+        extent = v->io.read_extent && !v->changes && !v->pending && !within && length >= capacity;
+        /* OFS blocks carry headers, so their runs go through a transfer
+         * buffer of at most 16 KiB and are checked block by block. */
+        if (extent && !v->format.fast && !transfer) {
+            /* Without the buffer, blocks are read one at a time. */
+            if (!transfer_blocks) {
+                uint32_t full = length / capacity;
+                transfer_blocks = 16384u >> v->block_shift;
+                if (!transfer_blocks) transfer_blocks = 1;
+                if (transfer_blocks > full) transfer_blocks = full;
+                transfer = v->io.alloc(v->io.context, transfer_blocks << v->block_shift);
+            }
+            if (!transfer) extent = 0;
+        }
+        if (extent) {
+            const unsigned char *slot = p + 24 + (v->buckets - 2 - n) * 4;
+            uint32_t run = 1, limit, i, sum, next = data_key + 1;
+            limit = v->format.fast ? length >> v->block_shift : length / capacity;
             if (limit > word(p, 8) - n) limit = word(p, 8) - n;
-            while (run < limit && data_key + run < v->blocks &&
-                   word(p, 24 + (v->buckets - 1 - n - run) * 4) == data_key + run)
-                ++run;
-            amount = run * capacity;
-            if (v->io.read_extent(v->io.context, data_key, out, amount)) {
-                err = FFS_IO; break;
+            if (limit > v->blocks - data_key) limit = v->blocks - data_key;
+            if (!v->format.fast && limit > transfer_blocks) limit = transfer_blocks;
+            /* Table slots run downward; count successive keys. */
+            while (run < limit && word(slot, 0) == next) { ++run; ++next; slot -= 4; }
+            if (v->format.fast) {
+                amount = run << v->block_shift;
+                if (v->io.read_extent(v->io.context, data_key, out, amount)) {
+                    err = FFS_IO; break;
+                }
+            } else {
+                amount = run * capacity;
+                if (v->io.read_extent(v->io.context, data_key, transfer, run << v->block_shift)) {
+                    err = FFS_IO; break;
+                }
+                for (i = 0, block = transfer; !err && i < run; ++i, block += v->block_size) {
+                    if (ffs_block_sum(block, v->block_size, &sum) || sum ||
+                        word(block, 0) != 8 || word(block, 4) != key ||
+                        word(block, 8) != index + i + 1 || word(block, 12) != capacity)
+                        err = FFS_CORRUPT;
+                    else memcpy(out + i * capacity, block + 24, capacity);
+                }
+                if (err) break;
             }
             index += run; n += run;
         } else {
             err = read_view(v, data_key, &payload, !v->format.fast);
             if (err) break;
             block = payload.bytes;
-            amount = capacity - offset % capacity;
+            amount = capacity - within;
             if (amount > length) amount = length;
             if (!v->format.fast && (word(block, 0) != 8 || word(block, 4) != key ||
                 word(block, 8) != index + 1 || word(block, 12) > capacity ||
-                word(block, 12) < offset % capacity + amount)) {
+                word(block, 12) < within + amount)) {
                 err = FFS_CORRUPT; break;
             }
-            memcpy(out, block + (v->format.fast ? 0 : 24) + offset % capacity, amount);
+            memcpy(out, block + (v->format.fast ? 0 : 24) + within, amount);
             release_view(v, &payload);
-            ++index; ++n;
+            ++index; ++n; within = 0;
         }
         out += amount; offset += amount; length -= amount; *actual += amount;
         if (length && n == v->buckets) {
@@ -759,6 +795,7 @@ int ffs_read(struct ffs_volume *v, uint32_t key, uint32_t offset, void *data,
     }
 done:
     release_view(v, &payload); release_view(v, &table);
+    if (transfer) v->io.free(v->io.context, transfer, transfer_blocks << v->block_shift);
     return err;
 }
 
