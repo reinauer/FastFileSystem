@@ -411,7 +411,7 @@ static int decode_entry(struct ffs_volume *v, uint32_t key,
         e->link = word(p, size - 44);
         e->backlink = word(p, size - 40);
         e->owner = word(p, size - 196);
-        memcpy(e->comment, p + size - 183, c);
+        if (c) memcpy(e->comment, p + size - 183, c);
     } else {
         e->size = e->protection = e->link = e->backlink = e->owner = 0;
         c = 0;
@@ -600,7 +600,8 @@ static int next_cached(struct ffs_volume *v, uint32_t dir, struct ffs_iterator *
                 e->link = e->backlink = e->hash_next = 0;
                 n = p[offset + 23]; c = p[offset + 24 + n];
                 memcpy(e->name, p + offset + 24, n); e->name[n] = 0;
-                memcpy(e->comment, p + offset + 25 + n, c); e->comment[c] = 0;
+                if (c) memcpy(e->comment, p + offset + 25 + n, c);
+                e->comment[c] = 0;
                 if (!valid_key(v, e->key) || (e->type != -3 && e->type != 2 && e->type != 3 &&
                     e->type != -4 && e->type != 4)) err = FFS_CORRUPT;
             }

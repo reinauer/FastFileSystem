@@ -8,7 +8,7 @@ typedef uint32_t memory_word __attribute__((__may_alias__));
 #else
 #define WORD_ALIGNMENT 3u
 #endif
-void *memcpy(void *dst, const void *src, size_t n)
+static __attribute__((__noinline__)) void *copy_long(void *dst, const void *src, size_t n)
 {
     unsigned char *d = dst;
     const unsigned char *s = src;
@@ -26,6 +26,17 @@ void *memcpy(void *dst, const void *src, size_t n)
             d += 4; s += 4; n -= 4;
         }
     }
+    while (n--) *d++ = *s++;
+    return dst;
+}
+/* Names and comments are short; they are copied without the register saves
+ * and alignment work of longer copies, which tail-call with the same
+ * arguments. */
+void *memcpy(void *dst, const void *src, size_t n)
+{
+    unsigned char *d = dst;
+    const unsigned char *s = src;
+    if (n >= 16) return copy_long(dst, src, n);
     while (n--) *d++ = *s++;
     return dst;
 }
