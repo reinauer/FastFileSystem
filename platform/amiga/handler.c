@@ -1390,7 +1390,17 @@ static void dispatch(struct handler *h, struct DosPacket *pkt)
     case ACTION_SET_DATE:
         err = lock_key(h, pkt->dp_Arg2, &key);
         from_bstr(name, pkt->dp_Arg3);
-        if (!err) err = ffs_resolve(&h->fs, key, name, &entry);
+        if (!err && pkt->dp_Type == ACTION_SET_COMMENT) {
+            /* A hard link keeps its own comment, as in FastFileSystem 47;
+             * protection and dates belong to its target. */
+            char *leaf;
+            uint32_t dir;
+            err = parent_name(h, pkt->dp_Arg2, name, &dir, &leaf);
+            if (!err && *leaf) {
+                err = ffs_lookup(&h->fs, dir, (const unsigned char *)leaf, strlen(leaf), &entry);
+                if (!err && entry.type == 3) err = FFS_SOFT_LINK;
+            } else if (!err) err = ffs_resolve(&h->fs, key, name, &entry);
+        } else if (!err) err = ffs_resolve(&h->fs, key, name, &entry);
         if (!err) {
             if (pkt->dp_Type == ACTION_SET_PROTECT) entry.protection = pkt->dp_Arg4;
             else if (pkt->dp_Type == ACTION_SET_DATE) {
