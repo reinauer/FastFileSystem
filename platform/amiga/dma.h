@@ -7,6 +7,8 @@ static int ffs_dma_range(uint32_t mask, uint32_t start, uint32_t size)
 {
     uint32_t end = start + size - 1, varying;
     if (!size || end < start || (start & ~mask)) return 0;
+    /* A mask without upper limits admits every range that does not wrap. */
+    if ((mask | 1u) == UINT32_MAX) return 1;
     varying = start ^ end;
     varying |= varying >> 1; varying |= varying >> 2; varying |= varying >> 4;
     varying |= varying >> 8; varying |= varying >> 16;
