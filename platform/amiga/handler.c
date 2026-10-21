@@ -1323,18 +1323,15 @@ static void dispatch(struct handler *h, struct DosPacket *pkt)
     }
     case ACTION_DELETE_OBJECT:
     case ACTION_RENAME_OBJECT: {
-        err = lock_key(h, pkt->dp_Arg1, &key);
+        char *leaf;
         from_bstr(name, pkt->dp_Arg2);
-        if (!err) {
-            char *leaf;
-            err = parent_name(h, pkt->dp_Arg1, name, &key, &leaf);
-            if (!err) err = ffs_lookup(&h->fs, key, (unsigned char *)leaf, strlen(leaf), &entry);
-        }
+        /* parent_name resolves the lock itself. */
+        err = parent_name(h, pkt->dp_Arg1, name, &key, &leaf);
+        if (!err) err = ffs_lookup(&h->fs, key, (unsigned char *)leaf, strlen(leaf), &entry);
         if (!err && in_use(h, entry.key)) err = ERROR_OBJECT_IN_USE;
         if (!err) changed(h, entry.key);
         if (!err && pkt->dp_Type == ACTION_DELETE_OBJECT) err = ffs_remove(&h->fs, entry.key);
         else if (!err) {
-            char *leaf;
             from_bstr(name, pkt->dp_Arg4);
             err = parent_name(h, pkt->dp_Arg3, name, &key, &leaf);
             if (!err) err = ffs_rename(&h->fs, entry.key, key, leaf);
