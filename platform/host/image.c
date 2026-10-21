@@ -26,7 +26,7 @@ static int image_flush(void *ctx)
     return fflush(f) || fsync(fileno(f));
 }
 static int parent_path(struct ffs_volume *v, const char *path, uint32_t *key,
-                        char name[31])
+                        char name[FFS_NAME_MAX + 1])
 {
     struct ffs_entry e;
     char *copy = malloc(strlen(path) + 1), *slash, *leaf;
@@ -36,7 +36,8 @@ static int parent_path(struct ffs_volume *v, const char *path, uint32_t *key,
     slash = strrchr(copy, '/');
     if (!slash) slash = strrchr(copy, ':');
     leaf = slash ? slash + 1 : copy;
-    if (strlen(leaf) > 30) { free(copy); return FFS_BAD_NAME; }
+    /* The core truncates longer names to the volume's limit. */
+    if (strlen(leaf) > FFS_NAME_MAX) leaf[FFS_NAME_MAX] = 0;
     strcpy(name, leaf);
     if (slash) slash[1] = 0;
     else copy[0] = 0;
@@ -67,7 +68,7 @@ int main(int argc, char **argv)
     uint32_t size = 512;
     FILE *f;
     int err = 0, writable;
-    char name[31];
+    char name[FFS_NAME_MAX + 1];
     uint32_t parent = 0;
     const char *env = getenv("FFS_BLOCK_SIZE");
     if (argc < 4 || (env && number(env, &size)) || !size) {
@@ -95,7 +96,7 @@ int main(int argc, char **argv)
     }
     if (!err && !strcmp(argv[2], "format") && argc == 5) {
         uint32_t variant;
-        if (number(argv[4], &variant) || variant > 5) err = FFS_BAD_NAME;
+        if (number(argv[4], &variant) || variant > 7) err = FFS_BAD_NAME;
         else err = ffs_format_volume(&volume, FFS_DOS_BASE + variant, argv[3]);
         goto done;
     }

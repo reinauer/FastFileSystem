@@ -86,12 +86,13 @@ struct ffs_file_state {
     uint32_t key, table, table_start, generation, cache_block, cache_offset;
     unsigned defer_metadata;
 };
-/* generation is the volume's when the entry was decoded. */
+/* generation is the volume's when the entry was decoded. comment_block is
+ * the DOS\6/7 block holding a comment too long to share the name's field. */
 struct ffs_entry {
     uint32_t key, parent, size, protection, days, minutes, ticks;
-    uint32_t link, hash_next, backlink, owner, generation;
+    uint32_t link, hash_next, backlink, owner, generation, comment_block;
     int32_t type;
-    unsigned char name[31], comment[80];
+    unsigned char name[FFS_NAME_MAX + 1], comment[80];
 };
 /* The iterator is invalidated by directory mutations. */
 struct ffs_iterator { uint32_t bucket, next, visited, index; };

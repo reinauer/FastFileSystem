@@ -448,12 +448,90 @@ static int header_view(struct ffs_volume *v, uint32_t key, struct block_view *vi
     }
     return err;
 }
+/* DOS\6/7 headers keep the name and comment as consecutive BCPL strings in
+ * the 112 bytes from the classic comment field, with a comment block at
+ * size - 72 when both do not fit, and move the date to size - 60. The root
+ * keeps the classic layout. */
+static uint32_t name_at(const struct ffs_volume *v)
+{
+    return v->block_size - (v->format.long_names ? 184 : 80);
+}
+static size_t name_limit(const struct ffs_volume *v)
+{
+    return v->format.long_names ? FFS_LONG_NAME_MAX : FFS_SHORT_NAME_MAX;
+}
+static uint32_t date_at(const struct ffs_volume *v, const unsigned char *p)
+{
+    return v->format.long_names && word(p, v->block_size - 4) != 1 ?
+           v->block_size - 60 : v->block_size - 92;
+}
+/* Name and inline comment lengths of a non-root header. */
+static int entry_names(const struct ffs_volume *v, const unsigned char *p,
+                       unsigned *n, unsigned *c)
+{
+    uint32_t at = name_at(v);
+    *n = p[at];
+    if (!v->format.long_names) {
+        *c = p[v->block_size - 184];
+        return !*n || *n > FFS_SHORT_NAME_MAX || *c > 79 ? FFS_CORRUPT : 0;
+    }
+    *c = *n <= FFS_NAME_MAX ? p[at + 1 + *n] : 0;
+    return !*n || *n > FFS_NAME_MAX || *c > 79 || *n + *c > 110 ? FFS_CORRUPT : 0;
+}
+/* A comment block names its own key and the header it belongs to. */
+static int read_comment(struct ffs_volume *v, uint32_t key, uint32_t block,
+                        unsigned char *comment)
+{
+    struct block_view view;
+    unsigned c;
+    int err = read_view(v, block, &view, 1);
+    if (err) return err;
+    c = view.bytes[24];
+    if (word(view.bytes, 0) != 64 || word(view.bytes, 4) != block ||
+        word(view.bytes, 8) != key || c > 79) err = FFS_CORRUPT;
+    else if (comment) { memcpy(comment, view.bytes + 25, c); comment[c] = 0; }
+    release_view(v, &view);
+    return err;
+}
+/* DOS\6/7 entries: the comment follows the name, or has its own block. */
+static int decode_long_entry(struct ffs_volume *v, uint32_t key,
+                             const unsigned char *p, struct ffs_entry *e)
+{
+    uint32_t size = v->block_size, block = word(p, size - 72);
+    unsigned n = p[size - 184], c = n <= FFS_NAME_MAX ? p[size - 183 + n] : 0;
+    int32_t type = (int32_t)word(p, size - 4);
+    if (n == 0 || n > FFS_NAME_MAX || c > 79 || n + c > 110 ||
+        (block && (!valid_key(v, block) || block == key)) ||
+        (type != -3 && type != 2 && type != 3 && type != -4 && type != 4))
+        return FFS_CORRUPT;
+    if (!e) return 0;
+    e->key = key;
+    e->generation = v->generation;
+    e->type = type;
+    e->parent = word(p, size - 12);
+    e->hash_next = word(p, size - 16);
+    e->days = word(p, size - 60);
+    e->minutes = word(p, size - 56);
+    e->ticks = word(p, size - 52);
+    e->size = word(p, size - 188);
+    e->protection = word(p, size - 192);
+    e->link = word(p, size - 44);
+    e->backlink = word(p, size - 40);
+    e->owner = word(p, size - 196);
+    e->comment_block = block;
+    memcpy(e->name, p + size - 183, n); e->name[n] = 0;
+    if (c) memcpy(e->comment, p + size - 182 + n, c);
+    e->comment[c] = 0;
+    /* Read last: the view may evict the cell holding p. */
+    return block ? read_comment(v, key, block, e->comment) : 0;
+}
 static int decode_entry(struct ffs_volume *v, uint32_t key,
                          const unsigned char *p, struct ffs_entry *e)
 {
     uint32_t size = v->block_size;
     unsigned n = p[size - 80], c = p[size - 184];
     int32_t type = (int32_t)word(p, size - 4);
+    if (v->format.long_names && key != v->root) return decode_long_entry(v, key, p, e);
     if (n == 0 || n > 30 || (key != v->root && c > 79)) return FFS_CORRUPT;
     if (key == v->root) {
         if (type != 1 || word(p, 8) || word(p, 16) ||
@@ -467,12 +545,13 @@ static int decode_entry(struct ffs_volume *v, uint32_t key,
     e->generation = v->generation;
     e->type = type;
     e->parent = word(p, size - 12);
-    e->hash_next = word(p, size - 16);
     e->days = word(p, size - 92);
     e->minutes = word(p, size - 88);
     e->ticks = word(p, size - 84);
+    e->comment_block = 0;
     memcpy(e->name, p + size - 79, n); e->name[n] = 0;
     if (key != v->root) {
+        e->hash_next = word(p, size - 16);
         e->size = word(p, size - 188);
         e->protection = word(p, size - 192);
         e->link = word(p, size - 44);
@@ -480,7 +559,8 @@ static int decode_entry(struct ffs_volume *v, uint32_t key,
         e->owner = word(p, size - 196);
         if (c) memcpy(e->comment, p + size - 183, c);
     } else {
-        e->size = e->protection = e->link = e->backlink = e->owner = 0;
+        /* A DOS\6/7 root keeps its dostype where entries keep their chain. */
+        e->hash_next = e->size = e->protection = e->link = e->backlink = e->owner = 0;
         c = 0;
     }
     e->comment[c] = 0;
@@ -558,8 +638,9 @@ int ffs_lookup(struct ffs_volume *v, uint32_t dir, const unsigned char *name,
 {
     struct block_view view;
     uint16_t hash;
-    uint32_t key, visited = 0;
+    uint32_t key, visited = 0, names = name_at(v);
     int err, match;
+    if (length > FFS_SHORT_NAME_MAX && length > name_limit(v)) length = name_limit(v);
     if (ffs_name_hash(name, length, v->format.international,
                       (uint16_t)v->buckets, &hash)) return FFS_BAD_NAME;
     err = header_view(v, dir, &view);
@@ -572,8 +653,7 @@ int ffs_lookup(struct ffs_volume *v, uint32_t dir, const unsigned char *name,
         err = header_view(v, key, &view);
         if (!err) {
             const unsigned char *p = view.bytes;
-            match = p[v->block_size - 80] == length &&
-                    same_name(v, name, p + v->block_size - 79, length);
+            match = p[names] == length && same_name(v, name, p + names + 1, length);
             /* Validate every chain member, but decode only the match. */
             err = decode_entry(v, key, p, match ? e : NULL);
             if (!err && word(p, v->block_size - 12) != dir) err = FFS_CORRUPT;
@@ -668,7 +748,7 @@ static int next_cached(struct ffs_volume *v, uint32_t dir, struct ffs_iterator *
                 e->minutes = ((uint32_t)p[offset + 18] << 8) | p[offset + 19];
                 e->ticks = ((uint32_t)p[offset + 20] << 8) | p[offset + 21];
                 e->type = (int8_t)p[offset + 22];
-                e->link = e->backlink = e->hash_next = 0;
+                e->link = e->backlink = e->hash_next = e->comment_block = 0;
                 n = p[offset + 23]; c = p[offset + 24 + n];
                 memcpy(e->name, p + offset + 24, n); e->name[n] = 0;
                 if (c) memcpy(e->comment, p + offset + 25 + n, c);
@@ -1141,6 +1221,12 @@ static int commit_changes_impl(struct ffs_volume *v, int err, unsigned char *roo
         put_word(published + v->block_size - 36, v->now[1]);
         put_word(published + v->block_size - 32, v->now[2]);
         put_word(published + v->block_size - 200, UINT32_MAX);
+        /* A DOS\6/7 root counts the allocated blocks, or holds 0 when they
+         * are unknown. FastFileSystem 47.4 neither reads nor updates the
+         * count, so it is never trusted here either. */
+        if (v->format.long_names)
+            put_word(published + v->block_size - 44, v->free_known ?
+                     v->blocks - v->reserved - (v->free_count + v->free_change) : 0);
         (void)ffs_block_checksum(published, v->block_size, 20);
         PROFILE_END(v, FFS_P_ROOT);
         if (write_owned(v, v->root, published, v->block_size) ||
@@ -1492,18 +1578,25 @@ int ffs_free_blocks(struct ffs_volume *v, uint32_t *count)
 }
 static void stamp(struct ffs_volume *v, unsigned char *p)
 {
-    put_word(p + v->block_size - 92, v->now[0]);
-    put_word(p + v->block_size - 88, v->now[1]);
-    put_word(p + v->block_size - 84, v->now[2]);
+    p += v->block_size - 92;
+    /* DOS\6/7 entries, unlike the root, keep their date 32 bytes on. */
+    if (v->format.long_names && word(p, 88) != 1) p += 32;
+    put_word(p, v->now[0]);
+    put_word(p + 4, v->now[1]);
+    put_word(p + 8, v->now[2]);
 }
-static int component(const char *name)
+/* Longer object names are truncated to the limit, as FastFileSystem does
+ * when creating and looking them up. Volume names keep 30 bytes on every
+ * format and are rejected beyond that (no length is requested). */
+static int component(const char *name, size_t limit, size_t *length)
 {
     size_t n = strlen(name), i;
-    if (!n || n > 30) return FFS_BAD_NAME;
+    if (!n || (!length && n > limit)) return FFS_BAD_NAME;
     for (i = 0; i < n; ++i) {
         unsigned ch = (unsigned char)name[i] & 0x7f;
         if (ch < 32 || ch == '/' || ch == ':') return FFS_BAD_NAME;
     }
+    if (length) *length = n < limit ? n : limit;
     return 0;
 }
 static int directory_cache(struct ffs_volume *v, uint32_t dir)
@@ -1683,6 +1776,41 @@ static int change_cache(struct ffs_volume *v, uint32_t dir, uint32_t key, int mo
 {
     return change_cache_position(v, dir, key, mode, NULL);
 }
+/* Store a DOS\6/7 name and comment in header p. The comment shares the
+ * name's 112 bytes when both fit; otherwise it moves to a comment block,
+ * and back once it fits again, as FastFileSystem 47.4 does. */
+static int put_long_names(struct ffs_volume *v, uint32_t key, unsigned char *p,
+                          const unsigned char *name, unsigned n,
+                          const unsigned char *comment, unsigned c)
+{
+    unsigned char nac[112], old[80], *q;
+    uint32_t block = word(p, v->block_size - 72);
+    unsigned i = 0;
+    int err = 0;
+    if (!n || n > FFS_NAME_MAX || c > 79) return FFS_CORRUPT;
+    memset(nac, 0, sizeof(nac));
+    nac[0] = (unsigned char)n; memcpy(nac + 1, name, n);
+    if (block) err = valid_key(v, block) && block != key ? read_comment(v, key, block, old) : FFS_CORRUPT;
+    /* An unchanged comment block is left as it is. */
+    if (!err && block) while (i < c && old[i] == comment[i]) ++i;
+    if (!err && n + c <= 110) {
+        nac[1 + n] = (unsigned char)c; memcpy(nac + 2 + n, comment, c);
+        if (block) err = bitmap_change(v, block, 1);
+        block = 0;
+    } else if (!err && (!block || i < c || old[c])) {
+        if (!block) err = allocate_block(v, &block);
+        if (!err) err = edit_block(v, block, &q, 20, 1);
+        if (!err) {
+            put_word(q, 64); put_word(q + 4, block); put_word(q + 8, key);
+            q[24] = (unsigned char)c; memcpy(q + 25, comment, c);
+        }
+    }
+    if (!err) {
+        memcpy(p + v->block_size - 184, nac, sizeof(nac));
+        put_word(p + v->block_size - 72, block);
+    }
+    return err;
+}
 static int insert_entry(struct ffs_volume *v, uint32_t dir, uint32_t key, unsigned char *p)
 {
     struct ffs_change *c;
@@ -1695,13 +1823,14 @@ static int insert_entry(struct ffs_volume *v, uint32_t dir, uint32_t key, unsign
     if (!err && word(parent, v->block_size - 4) != 1 &&
         word(parent, v->block_size - 4) != 2) err = FFS_WRONG_TYPE;
     if (!err) {
-        (void)ffs_name_hash(p + v->block_size - 79, p[v->block_size - 80],
+        uint32_t names = name_at(v);
+        (void)ffs_name_hash(p + names + 1, p[names],
                            v->format.international, (uint16_t)v->buckets, &hash);
         put_word(p + v->block_size - 16, word(parent, 24 + hash * 4));
         put_word(p + v->block_size - 12, dir);
         err = stage(v, key, p, 20);
         if (!err) err = journal(v, c, 24 + hash * 4, 4);
-        if (!err) err = journal(v, c, v->block_size - 92, 12);
+        if (!err) err = journal(v, c, date_at(v, parent), 12);
         if (!err) {
             put_word(parent + 24 + hash * 4, key);
             stamp(v, parent);
@@ -1716,12 +1845,13 @@ static int create_entry(struct ffs_volume *v, uint32_t dir, const char *name,
     unsigned char *p;
     struct ffs_entry existing;
     uint32_t newkey = 0;
+    size_t n = 0;
     int err = begin_change(v);
     if (err) return err;
-    err = component(name);
+    err = component(name, name_limit(v), &n);
     if (!err && target && strlen(target) >= v->buckets * 4) err = FFS_BAD_NAME;
     if (!err && !absent) {
-        err = ffs_lookup(v, dir, (const unsigned char *)name, strlen(name), &existing);
+        err = ffs_lookup(v, dir, (const unsigned char *)name, n, &existing);
         if (!err) err = FFS_EXISTS;
         else if (err == FFS_NOT_FOUND) err = 0;
     }
@@ -1731,8 +1861,8 @@ static int create_entry(struct ffs_volume *v, uint32_t dir, const char *name,
         put_word(p, 2); put_word(p + 4, newkey);
         put_word(p + v->block_size - 4, (uint32_t)type);
         if (target) memcpy(p + 24, target, strlen(target) + 1);
-        p[v->block_size - 80] = (unsigned char)strlen(name);
-        memcpy(p + v->block_size - 79, name, strlen(name)); stamp(v, p);
+        p[name_at(v)] = (unsigned char)n;
+        memcpy(p + name_at(v) + 1, name, n); stamp(v, p);
         if (link_key) {
             unsigned char *linked = buffer(v);
             if (!linked) err = FFS_NOMEM;
@@ -2322,9 +2452,9 @@ static int write_fast_impl(struct ffs_volume *v, struct ffs_file_state *state,
     if (!err && (word(head->bytes, 0) != 2 || word(head->bytes, 4) != key)) err = FFS_CORRUPT;
     if (!err && deferred_metadata(v, state)) {
         /* The streaming path needs no name, comment or directory snapshot. */
-        unsigned name_length = head->bytes[size - 80], comment_length = head->bytes[size - 184];
+        unsigned name_length, comment_length;
         entry->type = (int32_t)word(head->bytes, size - 4);
-        if (!name_length || name_length > 30 || comment_length > 79 ||
+        if (entry_names(v, head->bytes, &name_length, &comment_length) ||
             (entry->type != -3 && entry->type != 2 && entry->type != 3 &&
              entry->type != -4 && entry->type != 4)) err = FFS_CORRUPT;
         entry->size = word(head->bytes, size - 188);
@@ -2527,7 +2657,7 @@ static int unlink_entry(struct ffs_volume *v, const struct ffs_entry *e)
         if (next == e->key) {
             err = view_change(v, &view, &c, 20, 1);
             if (!err) err = journal(v, c, offset, 4);
-            if (!err && owner == e->parent) err = journal(v, c, v->block_size - 92, 12);
+            if (!err && owner == e->parent) err = journal(v, c, date_at(v, c->bytes), 12);
             if (!err) {
                 put_word(c->bytes + offset, e->hash_next);
                 if (owner == e->parent) stamp(v, c->bytes);
@@ -2691,6 +2821,7 @@ static int remove_entry(struct ffs_volume *v, uint32_t key, const struct ffs_ent
             }
             if (!err) err = unlink_entry(v, e);
             if (!err) err = bitmap_change(v, key, 1);
+            if (!err && e->comment_block) err = bitmap_change(v, e->comment_block, 1);
             if (!err) err = change_cache(v, e->parent, key, -1);
         } else if (!err) {
             /* Keep the real header key (OFS data and children refer to it),
@@ -2702,14 +2833,26 @@ static int remove_entry(struct ffs_volume *v, uint32_t key, const struct ffs_ent
             if (!err) err = unlink_entry(v, &other);
             if (!err) err = header(v, key, p);
             if (!err) {
-                memcpy(p + v->block_size - 80, linked + v->block_size - 80, 32);
-                memcpy(p + v->block_size - 184, linked + v->block_size - 184, 80);
+                if (v->format.long_names) {
+                    memcpy(p + v->block_size - 184, linked + v->block_size - 184, 112);
+                    put_word(p + v->block_size - 72, other.comment_block);
+                } else {
+                    memcpy(p + v->block_size - 80, linked + v->block_size - 80, 32);
+                    memcpy(p + v->block_size - 184, linked + v->block_size - 184, 80);
+                }
                 put_word(p + v->block_size - 192, other.protection);
                 put_word(p + v->block_size - 196, other.owner);
                 put_word(p + v->block_size - 40, other.backlink);
                 err = insert_entry(v, other.parent, key, p);
             }
             if (!err) err = bitmap_change(v, other.key, 1);
+            /* The header takes the link's comment block and frees its own. */
+            if (!err && e->comment_block) err = bitmap_change(v, e->comment_block, 1);
+            if (!err && other.comment_block) {
+                unsigned char *q;
+                err = edit_block(v, other.comment_block, &q, 20, 0);
+                if (!err) put_word(q + 8, key);
+            }
             if (!err) err = directory_cache(v, e->parent);
             if (!err) err = object_caches(v, key);
         }
@@ -2737,6 +2880,7 @@ static int remove_entry(struct ffs_volume *v, uint32_t key, const struct ffs_ent
     else if (!err && e->type != 3) err = FFS_WRONG_TYPE;
     if (!err) err = unlink_entry(v, e);
     if (!err) err = bitmap_change(v, key, 1);
+    if (!err && e->comment_block) err = bitmap_change(v, e->comment_block, 1);
     if (!err) err = change_cache(v, e->parent, key, -1);
     release(v, p);
     return finish_change(v, err);
@@ -2754,13 +2898,14 @@ int ffs_rename(struct ffs_volume *v, uint32_t key, uint32_t dir, const char *nam
     struct ffs_entry e, target;
     unsigned char *p = NULL;
     uint32_t ancestor = dir, seen = 0;
+    size_t n = 0;
     int err = begin_change(v);
     if (err) return err;
-    err = component(name);
+    err = component(name, name_limit(v), &n);
     if (!err) err = ffs_stat(v, key, &e);
     if (!err && (key == v->root || (e.protection & 1))) err = FFS_DELETE_PROTECTED;
     if (!err) {
-        err = ffs_lookup(v, dir, (const unsigned char *)name, strlen(name), &target);
+        err = ffs_lookup(v, dir, (const unsigned char *)name, n, &target);
         if (!err && target.key != key) err = FFS_EXISTS;
         else if (err == FFS_NOT_FOUND) err = 0;
     }
@@ -2773,12 +2918,15 @@ int ffs_rename(struct ffs_volume *v, uint32_t key, uint32_t dir, const char *nam
     p = buffer(v);
     if (!p && !err) err = FFS_NOMEM;
     if (!err) err = header(v, key, p);
-    if (!err) {
+    if (!err && v->format.long_names)
+        err = put_long_names(v, key, p, (const unsigned char *)name, (unsigned)n,
+                             e.comment, (unsigned)strlen((char *)e.comment));
+    else if (!err) {
         memset(p + v->block_size - 80, 0, 32);
-        p[v->block_size - 80] = (unsigned char)strlen(name);
-        memcpy(p + v->block_size - 79, name, strlen(name));
-        err = insert_entry(v, dir, key, p);
+        p[v->block_size - 80] = (unsigned char)n;
+        memcpy(p + v->block_size - 79, name, n);
     }
+    if (!err) err = insert_entry(v, dir, key, p);
     if (!err) err = directory_cache(v, e.parent);
     if (!err && dir != e.parent) err = directory_cache(v, dir);
     release(v, p);
@@ -2788,7 +2936,8 @@ int ffs_set_metadata(struct ffs_volume *v, uint32_t key, const struct ffs_entry 
 {
     unsigned char *p;
     size_t length = 0;
-    uint32_t parent = 0;
+    uint32_t parent = 0, at;
+    unsigned n, c;
     int err = begin_change(v);
     if (err) return err;
     while (length < sizeof(e->comment) && e->comment[length]) ++length;
@@ -2800,14 +2949,19 @@ int ffs_set_metadata(struct ffs_volume *v, uint32_t key, const struct ffs_entry 
         parent = word(p, v->block_size - 12);
         if (key != v->root) {
             put_word(p + v->block_size - 192, e->protection);
-            memset(p + v->block_size - 184, 0, 80);
-            p[v->block_size - 184] = (unsigned char)length;
-            memcpy(p + v->block_size - 183, e->comment, length);
+            if (!v->format.long_names) {
+                memset(p + v->block_size - 184, 0, 80);
+                p[v->block_size - 184] = (unsigned char)length;
+                memcpy(p + v->block_size - 183, e->comment, length);
+            } else if (!(err = entry_names(v, p, &n, &c)))
+                err = put_long_names(v, key, p, p + v->block_size - 183, n,
+                                     e->comment, (unsigned)length);
         }
-        put_word(p + v->block_size - 92, e->days);
-        put_word(p + v->block_size - 88, e->minutes);
-        put_word(p + v->block_size - 84, e->ticks);
-        err = stage(v, key, p, 20);
+        at = date_at(v, p);
+        put_word(p + at, e->days);
+        put_word(p + at + 4, e->minutes);
+        put_word(p + at + 8, e->ticks);
+        if (!err) err = stage(v, key, p, 20);
     }
     if (!err && parent) err = object_caches(v, key);
     release(v, p);
@@ -2924,6 +3078,7 @@ int ffs_validate(struct ffs_volume *v, unsigned repair)
         key = queue.keys[head++];
         err = mark_used(v, &used, key);
         if (!err) err = ffs_stat(v, key, &entry);
+        if (!err && entry.comment_block) err = mark_used(v, &used, entry.comment_block);
         if (err) break;
         if (entry.type == -4 || entry.type == 4) {
             struct ffs_entry target;
@@ -3064,7 +3219,7 @@ int ffs_relabel(struct ffs_volume *v, const char *name)
     unsigned char *p;
     int err = begin_change(v);
     if (err) return err;
-    err = component(name);
+    err = component(name, FFS_SHORT_NAME_MAX, NULL);
     if (err) return err;
     p = buffer(v);
     if (!p) return FFS_NOMEM;
@@ -3089,7 +3244,7 @@ int ffs_format_volume(struct ffs_volume *v, uint32_t dos_type, const char *name)
     err = ffs_flush(v);
     if (err) return err;
     refresh_date(v);
-    err = component(name);
+    err = component(name, FFS_SHORT_NAME_MAX, NULL);
     if (err || ffs_decode_type(dos_type, &format)) return FFS_BAD_NAME;
     pages = (v->blocks - v->reserved - 1) / bits + 1;
     extensions = pages > 25 ? (pages - 26) / slots + 1 : 0;
@@ -3145,6 +3300,7 @@ int ffs_format_volume(struct ffs_volume *v, uint32_t dos_type, const char *name)
         put_word(p + v->block_size - 96, extensions ? first_ext : 0);
         put_word(p + v->block_size - 8, format.dircache ? first_cache : 0);
         put_word(p + v->block_size - 4, 1);
+        if (format.long_names) put_word(p + v->block_size - 16, dos_type);
         p[v->block_size - 80] = (unsigned char)strlen(name);
         memcpy(p + v->block_size - 79, name, strlen(name)); stamp(v, p);
         for (i = 0; i < 3; ++i) put_word(p + v->block_size - 28 + i * 4, v->now[i]);

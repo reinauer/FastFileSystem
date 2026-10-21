@@ -773,7 +773,9 @@ static void fill_fib(const struct ffs_entry *entry, struct FileInfoBlock *fib)
     /* BSTRs followed by the name's terminator. */
     length = strlen((const char *)entry->name);
     fib->fib_FileName[0] = (char)length;
-    memcpy(fib->fib_FileName + 1, entry->name, length + 1);
+    /* A 107-byte name fills the field; its terminator would not fit. */
+    memcpy(fib->fib_FileName + 1, entry->name,
+           length < sizeof(fib->fib_FileName) - 1 ? length + 1 : length);
     length = strlen((const char *)entry->comment);
     fib->fib_Comment[0] = (char)length;
     if (length) memcpy(fib->fib_Comment + 1, entry->comment, length);
@@ -1430,16 +1432,18 @@ static void dispatch(struct handler *h, struct DosPacket *pkt)
     }
     case ACTION_READ_LINK: {
         const char *path = (const char *)pkt->dp_Arg2, *start, *colon;
-        char component_name[31];
+        char component_name[FFS_NAME_MAX + 1];
         uint32_t length = 0, capacity = pkt->dp_Arg4;
         char *target = (char *)pkt->dp_Arg3;
         err = lock_key(h, pkt->dp_Arg1, &key);
         colon = strchr(path, ':');
         if (colon) { key = h->fs.root; path = colon + 1; }
         while (!err && *path) {
+            size_t n;
             start = path; while (*path && *path != '/') ++path;
-            if (path - start > 30) { err = ERROR_INVALID_COMPONENT_NAME; break; }
-            memcpy(component_name, start, path - start); component_name[path - start] = 0;
+            /* Lookups truncate longer names to the volume's limit anyway. */
+            n = (size_t)(path - start) < FFS_NAME_MAX ? (size_t)(path - start) : FFS_NAME_MAX;
+            memcpy(component_name, start, n); component_name[n] = 0;
             if (!*component_name) {
                 err = ffs_stat(&h->fs, key, &entry);
                 if (!err) key = entry.parent;

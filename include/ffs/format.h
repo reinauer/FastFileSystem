@@ -5,12 +5,17 @@
 #include <stdint.h>
 
 #define FFS_DOS_BASE UINT32_C(0x444f5300)
-#define FFS_NAME_MAX 30u
+/* DOS\6/7 names reach 107 bytes, the DOS limit; FastFileSystem 47.4
+ * creates them only up to 106. Other formats keep 30. */
+#define FFS_NAME_MAX 107u
+#define FFS_LONG_NAME_MAX 106u
+#define FFS_SHORT_NAME_MAX 30u
 
 struct ffs_format {
     unsigned fast;
     unsigned international;
     unsigned dircache;
+    unsigned long_names;
 };
 
 /* Return 0 on success, -1 for invalid arguments; leave outputs untouched. */

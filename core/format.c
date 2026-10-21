@@ -10,12 +10,14 @@ typedef uint32_t disk_word __attribute__((__may_alias__));
 int ffs_decode_type(uint32_t type, struct ffs_format *format)
 {
     unsigned variant;
-    if (format == NULL || type < FFS_DOS_BASE || type > FFS_DOS_BASE + 5)
+    if (format == NULL || type < FFS_DOS_BASE || type > FFS_DOS_BASE + 7)
         return -1;
     variant = (unsigned)(type - FFS_DOS_BASE);
+    /* DOS\6/7 are long-name OFS/FFS: always international, never cached. */
     format->fast = variant & 1u;
     format->international = variant >= 2;
-    format->dircache = variant >= 4;
+    format->dircache = variant == 4 || variant == 5;
+    format->long_names = variant >= 6;
     return 0;
 }
 
