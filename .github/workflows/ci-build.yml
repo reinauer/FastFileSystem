@@ -1,0 +1,51 @@
+name: FastFileSystem CI
+
+on:
+  push:
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      matrix:
+        include:
+          - name: OS3 and ffs-image
+            artifact: os3
+            image: stefanreinauer/amiga-gcc:gcc-v13.4
+            targets: amigaos3 ffs-image
+          - name: OS4
+            artifact: os4
+            image: stefanreinauer/amigappc-gcc:latest
+            targets: amigaos4
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - name: Mark git directory as safe
+      run: git config --global --add safe.directory '*'
+
+    - name: Build
+      run: make ${{ matrix.targets }}
+
+    - name: Collect binaries
+      run: |
+        mkdir -p dist
+        if [ -f build/os3/FastFileSystem ]; then cp build/os3/FastFileSystem dist/FastFileSystem.OS3; fi
+        if [ -f build/os4/FastFileSystem ]; then cp build/os4/FastFileSystem dist/FastFileSystem.OS4; fi
+        if [ -f build/ffs-image ]; then cp build/ffs-image dist/ffs-image; fi
+
+    - name: Archive CI artifacts
+      uses: actions/upload-artifact@v6
+      with:
+        name: FastFileSystem (${{ matrix.artifact }})
+        path: dist/*
+        if-no-files-found: error
