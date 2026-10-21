@@ -33,13 +33,14 @@
 #define ENVF_DISABLENSD (1L << 18)
 #endif
 #include "dma.h"
+#include "version.h"
 #if defined(FFS_PROFILE) || !defined(__amigaos4__)
 #include <proto/timer.h>
 #endif
 
-/* Found by the Version command; bump the date with each release. */
+/* Found by the Version command; the Makefile supplies both fields. */
 static const char version[] __attribute__((__used__)) =
-    "$VER: FastFileSystem 1.0 (20.10.2026)";
+    "$VER: FastFileSystem " FFS_VERSION " (" FFS_DATE ")";
 
 /* OS3 packets carry positions and sizes as LONGs, so files grow only to
  * 2 GiB - 1. Larger files written elsewhere remain readable. */
