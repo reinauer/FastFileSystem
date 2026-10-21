@@ -696,13 +696,16 @@ static void release_records(struct handler *h, struct file_handle *file)
     }
     service_records(h, 0);
 }
+/* Owner and reserved fields belong to the caller: DOS clears them before
+ * examining, and OS4 keeps private context there. */
 static void fill_fib(const struct ffs_entry *entry, struct FileInfoBlock *fib)
 {
     size_t length;
-    memset(fib, 0, sizeof(*fib));
     fib->fib_DiskKey = entry->key;
     fib->fib_DirEntryType = entry->type;
-#ifndef __amigaos4__
+#ifdef __amigaos4__
+    fib->fib_Obsolete = entry->type;
+#else
     fib->fib_EntryType = entry->type;
 #endif
     fib->fib_Size = entry->size;
@@ -713,12 +716,14 @@ static void fill_fib(const struct ffs_entry *entry, struct FileInfoBlock *fib)
     fib->fib_Date.ds_Days = entry->days;
     fib->fib_Date.ds_Minute = entry->minutes;
     fib->fib_Date.ds_Tick = entry->ticks;
+    /* BSTRs followed by the name's terminator. */
     length = strlen((const char *)entry->name);
     fib->fib_FileName[0] = (char)length;
-    memcpy(fib->fib_FileName + 1, entry->name, length);
+    memcpy(fib->fib_FileName + 1, entry->name, length + 1);
     length = strlen((const char *)entry->comment);
     fib->fib_Comment[0] = (char)length;
-    memcpy(fib->fib_Comment + 1, entry->comment, length);
+    if (length) memcpy(fib->fib_Comment + 1, entry->comment, length);
+    fib->fib_Comment[length + 1] = 0;
 }
 static int parent_name(struct handler *h, BPTR lock, char *path,
                          uint32_t *parent, char **name)
