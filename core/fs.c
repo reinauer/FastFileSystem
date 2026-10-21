@@ -2903,7 +2903,7 @@ int ffs_validate(struct ffs_volume *v, unsigned repair)
     struct used_map used = {NULL, 0};
     struct key_list queue = {NULL, 0, 0};
     uint32_t head = 0, key, i, page, mapkey = 0;
-    uint32_t next, count, n, j, block, sequence, bits, value;
+    uint32_t next, count, n, j, block, sequence, bits, value, free_blocks = 0;
     struct ffs_iterator it;
     struct ffs_entry entry;
     int err = 0;
@@ -3028,11 +3028,13 @@ int ffs_validate(struct ffs_volume *v, unsigned repair)
             uint64_t first = (uint64_t)v->reserved + (uint64_t)page * bits + i;
             uint32_t mask = range_bits(first, 0, v->blocks);
             value = mask ? ~used_bits(&used, first) & mask : 0;
+            free_blocks += bit_count(value);
             if (repair) put_word(p + 4 + i / 8, value);
             else if ((word(p, 4 + i / 8) & mask) != value) err = FFS_CORRUPT;
         }
         if (!err && repair) err = write_bitmap_page(v, mapkey, p);
     }
+    if (!err) { v->free_count = free_blocks; v->free_known = 1; }
     if (!err && repair) {
         /* Rebuild cache records from their authoritative object headers. */
         for (i = 0; !err && i < queue.count; ++i) {
@@ -3120,6 +3122,10 @@ int ffs_format_volume(struct ffs_volume *v, uint32_t dos_type, const char *name)
         if (v->io.write(v->io.context, first_ext + page, p, v->block_size)) err = FFS_IO;
     }
     if (err) v->failed = 1;
+    else {
+        /* The root, bitmap and its extensions, and a cache block are used. */
+        v->free_count = v->blocks - v->reserved - (last - v->root); v->free_known = 1;
+    }
     if (!err && format.dircache) {
         memset(p, 0, v->block_size);
         put_word(p, 33); put_word(p + 4, first_cache); put_word(p + 8, v->root);
