@@ -1091,33 +1091,41 @@ static void dispatch(struct handler *h, struct DosPacket *pkt)
         break;
     case ACTION_EXAMINE_NEXT: {
         struct FileInfoBlock *fib = BADDR(pkt->dp_Arg2);
-        struct ffs_iterator it = {0, 0, 0, 0};
+        struct file_lock *dirlock = pkt->dp_Arg1 ? get_lock(h, pkt->dp_Arg1) : NULL;
+        struct ffs_iterator scan = {0, 0, 0, 0}, *it = &scan;
         uint32_t previous = fib->fib_DiskKey;
-        err = lock_key(h, pkt->dp_Arg1, &key);
-        if (!err && h->fs.format.dircache) {
-            struct file_lock *dirlock = get_lock(h, pkt->dp_Arg1);
-            if (dirlock && dirlock->previous == previous && previous != key &&
-                dirlock->generation == h->fs.generation) it = dirlock->iterator;
-            else if (previous != key) {
-                do { err = ffs_next(&h->fs, key, &it, &entry); }
+        key = dirlock ? (uint32_t)dirlock->dos.fl_Key : h->fs.root;
+        if (pkt->dp_Arg1 && !dirlock) err = ERROR_INVALID_LOCK;
+        else if (h->fs.format.dircache) {
+            /* The lock's cursor advances in place while it stays valid. */
+            if (dirlock) {
+                it = &dirlock->iterator;
+                if (dirlock->previous != previous || previous == key ||
+                    dirlock->generation != h->fs.generation) {
+                    memset(it, 0, sizeof(*it));
+                    dirlock->generation = h->fs.generation;
+                    if (previous != key) {
+                        do { err = ffs_next(&h->fs, key, it, &entry); }
+                        while (!err && entry.key != previous);
+                    }
+                }
+            } else if (previous != key) {
+                do { err = ffs_next(&h->fs, key, it, &entry); }
                 while (!err && entry.key != previous);
             }
-            if (!err) err = ffs_next(&h->fs, key, &it, &entry);
-            if (!err && dirlock) {
-                dirlock->iterator = it; dirlock->previous = entry.key;
-                dirlock->generation = h->fs.generation;
-            }
+            if (!err) err = ffs_next(&h->fs, key, it, &entry);
+            if (dirlock) dirlock->previous = err ? key : entry.key;
         } else {
-            if (!err && previous != key) {
+            if (previous != key) {
                 uint16_t bucket;
                 err = ffs_stat(&h->fs, previous, &entry);
                 if (!err && entry.parent != key) err = ERROR_NO_MORE_ENTRIES;
                 if (!err && ffs_name_hash(entry.name, strlen((char *)entry.name),
                         h->fs.format.international, (uint16_t)h->fs.buckets, &bucket))
                     err = ERROR_NOT_A_DOS_DISK;
-                if (!err) { it.bucket = bucket + 1; it.next = entry.hash_next; }
+                if (!err) { scan.bucket = bucket + 1; scan.next = entry.hash_next; }
             }
-            if (!err) err = ffs_next(&h->fs, key, &it, &entry);
+            if (!err) err = ffs_next(&h->fs, key, &scan, &entry);
         }
         if (!err) fill_fib(&entry, fib);
         break;
