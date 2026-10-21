@@ -440,7 +440,8 @@ static int device_io_impl(struct handler *h, uint32_t block, void *data,
     if (h->media_changed || h->writes.failed) return -1;
     if (!media_interrupt_active(h) && check_media(h)) return -1;
     h->motor_on = 1; h->motor_idle = 0;
-    if ((direct || command != CMD_WRITE) && drain_writes(h)) return -1;
+    /* Idle queues need no drain: failures are latched and checked above. */
+    if ((direct || command != CMD_WRITE) && h->writes.busy && drain_writes(h)) return -1;
     /* Startup checked the partition against the device's addressing. */
     if (block >= h->fs.blocks ||
         size > ((uint64_t)(h->fs.blocks - block) << h->fs.block_shift)) return -1;
