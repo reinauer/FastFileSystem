@@ -3041,6 +3041,12 @@ int ffs_validate(struct ffs_volume *v, unsigned repair)
             err = ffs_stat(v, queue.keys[i], &entry);
             if (!err && (entry.type == 1 || entry.type == 2)) err = directory_cache(v, queue.keys[i]);
         }
+        /* The commit publishes the root as valid, even when nothing else
+         * changed. */
+        if (!err) {
+            unsigned char *root;
+            err = edit_block(v, v->root, &root, 20, 0);
+        }
     }
 done:
     free_used(v, &used);
