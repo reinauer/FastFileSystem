@@ -1285,15 +1285,22 @@ static int bitmap_key(struct ffs_volume *v, uint32_t page, uint32_t *key)
     v->bitmap_base = v->reserved + page * ((v->block_size - 4) * 8);
     return 0;
 }
+/* A key's bit within its bitmap page. Most volumes have a single page, and
+ * on the 68000 division is a library call. */
+static uint32_t bitmap_bit(const struct ffs_volume *v, uint32_t key, uint32_t *page)
+{
+    uint32_t bits = (v->block_size - 4) * 8, bit = key - v->reserved;
+    if (bit < bits) { *page = 0; return bit; }
+    *page = bit / bits;
+    return bit % bits;
+}
 static int bitmap_change(struct ffs_volume *v, uint32_t key, unsigned make_free)
 {
     uint32_t page, mapkey = 0, bit, value, offset;
     unsigned char *p;
     int err;
     if (!valid_key(v, key) || key == v->root) return FFS_CORRUPT;
-    bit = key - v->reserved;
-    page = bit / ((v->block_size - 4) * 8);
-    bit %= (v->block_size - 4) * 8;
+    bit = bitmap_bit(v, key, &page);
     err = bitmap_key(v, page, &mapkey);
     if (err) return err;
     if (key == mapkey) return FFS_CORRUPT;
@@ -1315,7 +1322,7 @@ static int allocate_block_impl(struct ffs_volume *v, uint32_t *key)
 {
     struct block_view view = {NULL, NULL};
     unsigned char *p;
-    uint32_t bits = (v->block_size - 4) * 8, page, mapkey = 0;
+    uint32_t page, mapkey = 0;
     uint32_t start = valid_key(v, v->alloc_hint) ? v->alloc_hint : v->reserved;
     uint32_t candidate, limit, bit, loaded = UINT32_MAX;
     unsigned pass;
@@ -1324,7 +1331,7 @@ static int allocate_block_impl(struct ffs_volume *v, uint32_t *key)
         candidate = pass ? v->reserved : start;
         limit = pass ? start : v->blocks;
         for (; !err && candidate < limit; ++candidate) {
-            bit = candidate - v->reserved; page = bit / bits; bit %= bits;
+            bit = bitmap_bit(v, candidate, &page);
             if (loaded != page) {
                 release_view(v, &view);
                 err = bitmap_key(v, page, &mapkey);
@@ -2443,15 +2450,15 @@ static int release_cached(struct ffs_volume *v, uint32_t first, uint32_t count)
 /* Free a run of allocated blocks by bitmap word. */
 static int free_run(struct ffs_volume *v, uint32_t first, uint32_t count)
 {
-    uint32_t bits = (v->block_size - 4) * 8, bit, n, mapkey = 0, offset, amount, mask, value;
+    uint32_t bits = (v->block_size - 4) * 8, bit, n, mapkey = 0, offset, amount, mask, value, page;
     unsigned char *p;
     int err;
     if (first < v->reserved || first >= v->blocks || count > v->blocks - first ||
         v->root - first < count) return FFS_CORRUPT;
     while (count) {
-        bit = (first - v->reserved) % bits;
+        bit = bitmap_bit(v, first, &page);
         n = bits - bit < count ? bits - bit : count;
-        err = bitmap_key(v, (first - v->reserved) / bits, &mapkey);
+        err = bitmap_key(v, page, &mapkey);
         if (!err && mapkey - first < n) err = FFS_CORRUPT;
         if (!err) err = edit_block(v, mapkey, &p, 0, 0);
         if (err) return err;
