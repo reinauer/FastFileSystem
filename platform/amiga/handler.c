@@ -1602,8 +1602,9 @@ int ffs_handler_main(void)
             (void)drain_writes(h);
             clear_cache(h); ffs_discard(&h->fs); h->fs.failed = 1;
         }
-        if (h->notify_port) returned_notices(h);
-        if (h->timer_port && GetMsg(h->timer_port)) {
+        /* Ports with nothing outstanding cannot hold a reply. */
+        if (h->notify_pending) returned_notices(h);
+        if (h->timer_pending && GetMsg(h->timer_port)) {
             h->timer_pending = 0;
             if (h->media_ticks <= h->timer_ticks) h->media_ticks = 0;
             else h->media_ticks -= h->timer_ticks;
