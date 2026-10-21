@@ -1005,8 +1005,9 @@ static unsigned char *disk_root(struct ffs_volume *v)
     return c && c->state == BLOCK_CLEAN && c->verified ? c->bytes : NULL;
 }
 /* Clear validity on the OLD root before any metadata or direct data is
- * replaced. A clean cached root is edited in place and stays coherent. */
-static int invalidate_root(struct ffs_volume *v, unsigned char *scratch)
+ * replaced; the following flush makes it durable first. A clean cached
+ * root is edited in place and stays coherent. */
+static int submit_invalid_root(struct ffs_volume *v, unsigned char *scratch)
 {
     unsigned char *p = disk_root(v);
     if (!p && v->io.read(v->io.context, v->root, p = scratch, v->block_size)) return FFS_IO;
@@ -1015,7 +1016,11 @@ static int invalidate_root(struct ffs_volume *v, unsigned char *scratch)
     if (write_owned(v, v->root, p, v->block_size)) {
         drain_owned(v); return FFS_IO;
     }
-    if (flush_device(v)) return FFS_IO;
+    return 0;
+}
+static int invalidate_root(struct ffs_volume *v, unsigned char *scratch)
+{
+    if (submit_invalid_root(v, scratch) || flush_device(v)) return FFS_IO;
     drop_root_image(v);
     return 0;
 }
@@ -1119,10 +1124,15 @@ static int write_direct(struct ffs_volume *v, unsigned char *root, uint32_t file
 {
     uint32_t i, count;
     struct ffs_change *c, *next;
+    unsigned invalidating = !v->disk_dirty;
     if (!v->direct_count) return 0;
-    if (!v->disk_dirty) {
-        if (invalidate_root(v, root)) return FFS_IO;
+    for (i = 0; i < v->direct_count; ++i)
+        if (v->root - v->direct[i].key < v->direct[i].blocks) return FFS_CORRUPT;
+    /* The root write overlaps the cache scan below; the flush completes it
+     * before any data is transferred. */
+    if (invalidating) {
         v->disk_dirty = 1;
+        if (submit_invalid_root(v, root)) return FFS_IO;
     }
     for (i = 0; i < v->direct_count; ++i) {
         struct ffs_data_run *run = &v->direct[i];
@@ -1142,7 +1152,7 @@ static int write_direct(struct ffs_volume *v, unsigned char *root, uint32_t file
                         /* A damaged mapping must not free metadata held by the plan. */
                         if ((c->state == BLOCK_CHANGE || c->state == BLOCK_PENDING) &&
                             c->checksum >= 0) {
-                            PROFILE_END(v, FFS_P_INVALIDATE); return FFS_CORRUPT;
+                            PROFILE_END(v, FFS_P_INVALIDATE); drain_owned(v); return FFS_CORRUPT;
                         }
                         if (c->state != BLOCK_CHANGE) {
                             if (c->state == BLOCK_CLEAN) unlink_clean(v, c);
@@ -1155,6 +1165,13 @@ static int write_direct(struct ffs_volume *v, unsigned char *root, uint32_t file
             }
             PROFILE_END(v, FFS_P_INVALIDATE);
         }
+    }
+    if (invalidating) {
+        if (flush_device(v)) return FFS_IO;
+        drop_root_image(v);
+    }
+    for (i = 0; i < v->direct_count; ++i) {
+        struct ffs_data_run *run = &v->direct[i];
         if (!v->format.fast) {
             if (write_ofs_run(v, run, file, transfer, transfer_size)) return FFS_IO;
         } else if (v->io.write_extent(v->io.context, run->key, run->data, run->size)) return FFS_IO;
