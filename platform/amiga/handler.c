@@ -41,6 +41,14 @@
 static const char version[] __attribute__((__used__)) =
     "$VER: FastFileSystem 1.0 (20.10.2026)";
 
+/* OS3 packets carry positions and sizes as LONGs, so files grow only to
+ * 2 GiB - 1. Larger files written elsewhere remain readable. */
+#ifdef __amigaos4__
+#define FILE_LIMIT UINT32_MAX
+#else
+#define FILE_LIMIT INT32_MAX
+#endif
+
 /* Device addressing for the partition. */
 enum { IO32, IO64_TD64, IO64_NSD };
 struct file_lock {
@@ -294,6 +302,7 @@ static int remount_volume(struct handler *h)
     err = ffs_mount(&h->fs, &io, size, blocks, reserved,
                     !h->user_protected && !media_protected(h));
     h->fs.cache_limit = h->cache_count;
+    h->fs.file_limit = FILE_LIMIT;
     return err;
 }
 /* The callback only invalidates the medium and wakes its owning task. */
@@ -940,9 +949,9 @@ static void current_date(void *ctx, uint32_t *now)
     DateStamp(&date);
     now[0] = date.ds_Days; now[1] = date.ds_Minute; now[2] = date.ds_Tick;
 }
-/* Seek or resize through a file handle. Positions and sizes span the
- * unsigned 32-bit size field. A seek yields the previous position; a resize
- * yields the new size. */
+/* Seek or resize through a file handle. Positions span the unsigned 32-bit
+ * size field; growth stops at FILE_LIMIT. A seek yields the previous
+ * position; a resize yields the new size. */
 static int move_file(struct handler *h, struct file_handle *file, int64_t offset,
                      LONG mode, unsigned resize, uint32_t *value)
 {
@@ -1586,6 +1595,7 @@ int ffs_handler_main(void)
     err = ffs_mount(&h->fs, &io, (uint32_t)block_size,
                     (uint32_t)(total / env->de_SectorPerBlock), env->de_Reserved,
                     !media_protected(h));
+    h->fs.file_limit = FILE_LIMIT;
     if (err == ERROR_NO_FREE_STORE) goto done;
     if (!err) {
         if (!h->fs.writable && h->fs.write_requested) (void)ffs_validate(&h->fs, 1);

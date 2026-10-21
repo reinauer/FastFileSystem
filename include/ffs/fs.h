@@ -63,6 +63,9 @@ struct ffs_volume {
     uint32_t free_count, free_change;
     unsigned free_known;
     uint32_t now[3], created[3], alloc_hint, generation;
+    /* Writes and resizes may not grow a file beyond this size. Larger files
+     * remain readable and may be overwritten in place or shrunk. */
+    uint32_t file_limit;
     unsigned in_place;
 #ifdef FFS_PROFILE
     struct ffs_profile profile;

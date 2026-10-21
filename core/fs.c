@@ -432,6 +432,7 @@ int ffs_mount(struct ffs_volume *v, const struct ffs_io *io, uint32_t size,
     memset(v, 0, sizeof(*v));
     v->write_requested = writable && io->write && io->flush;
     v->io = *io; v->block_size = size; v->blocks = blocks;
+    v->file_limit = UINT32_MAX;
     while ((UINT32_C(1) << v->block_shift) < size) ++v->block_shift;
     v->reserved = reserved;
     v->root = reserved + (blocks - reserved - 1) / 2;
@@ -1759,6 +1760,7 @@ int ffs_resize(struct ffs_volume *v, uint32_t key, uint32_t size)
     if (!err) err = ffs_stat(v, key, &e);
     if (!err && e.type != -3) err = FFS_WRONG_TYPE;
     if (!err && (e.protection & 4)) err = 223;
+    if (!err && size > e.size && size > v->file_limit) err = 207;
     if (err) return err;
     if (size > e.size) {
         struct ffs_file_state state;
@@ -2164,6 +2166,7 @@ static int write_fast_impl(struct ffs_volume *v, struct ffs_file_state *state,
     } else if (!err) err = decode_entry(v, key, head->bytes, entry);
     if (!err && entry->type != -3) err = FFS_WRONG_TYPE;
     if (!err && (entry->protection & 4)) err = 223;
+    if (!err && end > entry->size && end > v->file_limit) err = 207;
     if (err) goto done;
     if (v->format.fast) {
         first = (offset < entry->size ? offset : entry->size) >> v->block_shift;
