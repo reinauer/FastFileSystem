@@ -71,7 +71,7 @@ int main(int argc, char **argv)
     uint32_t parent = 0;
     const char *env = getenv("FFS_BLOCK_SIZE");
     if (argc < 4 || (env && number(env, &size)) || !size) {
-        fprintf(stderr, "usage: ffs-image image COMMAND PATH [ARGS]\ncommands: list; cat [offset length]; mkdir; put host-file; rm;\n          rename new-path; truncate size; check; repair; format variant\n");
+        fprintf(stderr, "usage: ffs-image image COMMAND PATH [ARGS]\ncommands: list; cat [offset length]; mkdir; put host-file; rm;\n          rename new-path; truncate size; comment text; check; repair;\n          format variant\n");
         return 2;
     }
     writable = strcmp(argv[2], "cat") && strcmp(argv[2], "list") && strcmp(argv[2], "check");
@@ -140,6 +140,12 @@ int main(int argc, char **argv)
     else if (!err && !strcmp(argv[2], "truncate") && argc == 5) {
         if (number(argv[4], &length)) err = FFS_BAD_NAME;
         else err = ffs_resize(&volume, entry.key, length);
+    } else if (!err && !strcmp(argv[2], "comment") && argc == 5) {
+        if (strlen(argv[4]) >= sizeof(entry.comment)) err = FFS_BAD_NAME;
+        else {
+            strcpy((char *)entry.comment, argv[4]);
+            err = ffs_set_metadata(&volume, entry.key, &entry);
+        }
     } else if (!err && !strcmp(argv[2], "rename") && argc == 5) {
         err = parent_path(&volume, argv[4], &parent, name);
         if (!err) err = ffs_rename(&volume, entry.key, parent, name);
