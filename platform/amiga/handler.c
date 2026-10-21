@@ -123,6 +123,12 @@ struct handler {
     uint32_t media_number;
     unsigned opened, quitting, inhibited, user_protected, protected_writable;
     unsigned copy_ready, borrow_ready, motor_on, motor_idle;
+    /* An ACTION_WRITE buffer stays valid until the packet's reply, so its
+     * final transfer may still run while the core finishes the write. */
+    struct IOStdReq *packet_request;
+    uintptr_t packet_data;
+    uint32_t packet_size, packet_length;
+    unsigned packet_pending;
     void *spare_locks, *spare_files;
     LONG password;
 };
@@ -383,6 +389,20 @@ static int finish_write(void *context, struct ffs_write_slot *s)
     PROFILE_END(&h->fs, FFS_P_WAIT);
     return err ? -1 : 0;
 }
+static int finish_packet_write(struct handler *h)
+{
+    struct IOStdReq *r = h->packet_request;
+    int err;
+    if (!h->packet_pending) return 0;
+    h->packet_pending = 0;
+    PROFILE_START(&h->fs);
+    if (h->media_changed && !CheckIO((struct IORequest *)r)) AbortIO((struct IORequest *)r);
+    err = WaitIO((struct IORequest *)r) || r->io_Actual != h->packet_length || h->media_changed;
+    PROFILE_END(&h->fs, FFS_P_WAIT);
+    /* The core already counts the data as written. */
+    if (err) h->fs.failed = 1;
+    return err ? -1 : 0;
+}
 static int drain_writes(struct handler *h)
 {
     if (ffs_queue_drain(&h->writes)) h->fs.failed = 1;
@@ -405,11 +425,17 @@ static void init_write_requests(struct handler *h, uint32_t block_size)
         if (i < FFS_QUEUE_COPIES && (!r || !s->bytes)) h->copy_ready = 0;
         if (i >= FFS_QUEUE_COPIES && !r) h->borrow_ready = 0;
     }
+    h->packet_request = (struct IOStdReq *)CreateIORequest(h->io_port, sizeof(*h->packet_request));
+    if (h->packet_request) {
+        h->packet_request->io_Device = h->request->io_Device;
+        h->packet_request->io_Unit = h->request->io_Unit;
+    }
 }
 static void free_write_requests(struct handler *h)
 {
     unsigned i;
-    (void)drain_writes(h);
+    (void)finish_packet_write(h); (void)drain_writes(h);
+    if (h->packet_request) DeleteIORequest((struct IORequest *)h->packet_request);
     for (i = 0; i < FFS_QUEUE_SLOTS; ++i) {
         struct ffs_write_slot *s = &h->writes.slots[i];
         if (s->request) DeleteIORequest((struct IORequest *)s->request);
@@ -441,16 +467,19 @@ static void motor_off(struct handler *h)
     h->motor_on = h->motor_idle = 0;
 }
 /* Transfer modes: copy through owned DMA buffers, transfer the caller's
- * DMA-compatible buffer synchronously, or borrow it until the next drain. */
-enum { IO_COPY, IO_DIRECT, IO_BORROW };
+ * DMA-compatible buffer synchronously, borrow it until the next drain, or
+ * leave a write packet's final transfer running until the next device
+ * access or the reply. */
+enum { IO_COPY, IO_DIRECT, IO_BORROW, IO_PACKET };
 static int device_io_impl(struct handler *h, uint32_t block, void *data,
                       uint32_t size, UWORD command, unsigned mode)
 {
     uint64_t absolute;
     unsigned char *p = data;
-    unsigned direct = mode == IO_DIRECT;
+    unsigned direct = mode == IO_DIRECT || mode == IO_PACKET;
     if (mode == IO_BORROW && !h->borrow_ready) mode = IO_COPY;
-    if (h->media_changed || h->writes.failed) return -1;
+    if ((h->packet_pending && finish_packet_write(h)) || h->media_changed || h->writes.failed)
+        return -1;
     if (!media_interrupt_active(h) && check_media(h)) return -1;
     h->motor_on = 1; h->motor_idle = 0;
     /* Idle queues need no drain: failures are latched and checked above. */
@@ -475,6 +504,7 @@ static int device_io_impl(struct handler *h, uint32_t block, void *data,
         }
         {
             unsigned char *dma = direct ? p : h->writes.slots[0].bytes;
+            struct IOStdReq *r = mode == IO_PACKET && n == size ? h->packet_request : h->request;
             unsigned allocated = 0;
             int err;
             if (!direct && n > h->writes.capacity) n = h->writes.capacity;
@@ -484,14 +514,19 @@ static int device_io_impl(struct handler *h, uint32_t block, void *data,
             }
             if (!dma) return -1;
             if (!direct && command == CMD_WRITE) memcpy(dma, p, n);
-            prepare_transfer(h, h->request, command, absolute);
-            h->request->io_Data = dma;
-            h->request->io_Length = n;
+            prepare_transfer(h, r, command, absolute);
+            r->io_Data = dma;
+            r->io_Length = n;
+            if (r == h->packet_request) {
+                SendIO((struct IORequest *)r);
+                h->packet_length = n; h->packet_pending = 1;
+                return 0;
+            }
             if (direct) {
-                SendIO((struct IORequest *)h->request);
-                err = WaitIO((struct IORequest *)h->request);
-            } else err = DoIO((struct IORequest *)h->request);
-            err = err || h->request->io_Actual != n || h->media_changed;
+                SendIO((struct IORequest *)r);
+                err = WaitIO((struct IORequest *)r);
+            } else err = DoIO((struct IORequest *)r);
+            err = err || r->io_Actual != n || h->media_changed;
             if (!err && !direct && command == CMD_READ) memcpy(p, dma, n);
             if (allocated) FreeMem(dma, n);
             if (err) return -1;
@@ -520,12 +555,17 @@ static int device_write(void *ctx, uint32_t block, const unsigned char *data, ui
 {
     return device_io(ctx, block, (void *)data, size, CMD_WRITE, IO_COPY);
 }
-/* Borrow a DMA-compatible extent until completion instead of copying it
- * into Chip RAM. Owned-buffer queuing remains the fallback. */
+/* Transfer a DMA-compatible extent directly instead of copying it into Chip
+ * RAM; owned-buffer queuing remains the fallback. Data inside the current
+ * write packet's buffer may finish after the call. */
 static int device_write_extent(void *ctx, uint32_t block, const unsigned char *data, uint32_t size)
 {
-    return device_io(ctx, block, (void *)data, size, CMD_WRITE,
-                     dma_address(ctx, data, size) ? IO_DIRECT : IO_COPY);
+    struct handler *h = ctx;
+    uintptr_t offset = (uintptr_t)data - h->packet_data;
+    unsigned mode = dma_address(ctx, data, size) ? IO_DIRECT : IO_COPY;
+    if (mode == IO_DIRECT && h->packet_request && offset < h->packet_size &&
+        size <= h->packet_size - offset) mode = IO_PACKET;
+    return device_io(ctx, block, (void *)data, size, CMD_WRITE, mode);
 }
 /* The core keeps these bytes unchanged until its next flush, so several
  * metadata writes can be in flight before one drain. */
@@ -539,7 +579,7 @@ static int device_flush(void *ctx)
     struct handler *h = ctx;
     int err;
     PROFILE_START(&h->fs);
-    err = drain_writes(h);
+    err = finish_packet_write(h) || drain_writes(h);
     if (!err) {
         h->request->io_Command = CMD_UPDATE;
         err = DoIO((struct IORequest *)h->request) != 0;
@@ -1252,8 +1292,13 @@ static void dispatch(struct handler *h, struct DosPacket *pkt)
             if (pkt->dp_Type == ACTION_READ)
                 err = ffs_read(&h->fs, file->lock->dos.fl_Key, file->position,
                                (void *)pkt->dp_Arg2, pkt->dp_Arg3, &got);
-            else err = ffs_write_file(&h->fs, &file->mapping, file->lock->dos.fl_Key, file->position,
-                                 (const void *)pkt->dp_Arg2, pkt->dp_Arg3, &got);
+            else {
+                h->packet_data = (uintptr_t)pkt->dp_Arg2; h->packet_size = pkt->dp_Arg3;
+                err = ffs_write_file(&h->fs, &file->mapping, file->lock->dos.fl_Key, file->position,
+                                     (const void *)pkt->dp_Arg2, pkt->dp_Arg3, &got);
+                h->packet_size = 0;
+                if (finish_packet_write(h) && !err) { err = FFS_IO; got = 0; }
+            }
             if (!err && pkt->dp_Type == ACTION_WRITE) changed(h, file->lock->dos.fl_Key);
             file->position += got;
         }
