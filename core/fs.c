@@ -18,6 +18,10 @@ struct ffs_change {
     uint32_t key;
     int checksum;
     unsigned close_update, state, readers, verified;
+    /* A pending block taken in place: its prior checksum offset and
+     * verification, restored with its journaled bytes on abort. */
+    unsigned journaled, saved_verified;
+    int saved_checksum;
     unsigned char bytes[];
 };
 
@@ -80,7 +84,7 @@ unsigned ffs_cache_resize(struct ffs_volume *v, unsigned count)
         c = v->io.alloc(v->io.context, sizeof(*c) + v->block_size);
         if (!c) break;
         c->key = UINT32_MAX; c->rollback = NULL;
-        c->close_update = c->readers = c->verified = 0;
+        c->close_update = c->readers = c->verified = c->journaled = 0;
         link_clean(v, c);
     }
     v->cache_limit = v->clean_count;
@@ -94,11 +98,11 @@ static struct ffs_change *new_block(struct ffs_volume *v)
      * Prefer spare storage within its budget; evict clean data on failure. */
     if (!c || (c->key != UINT32_MAX && v->clean_count < v->cache_limit)) {
         c = v->io.alloc(v->io.context, sizeof(*c) + v->block_size);
-        if (c) { c->rollback = NULL; c->close_update = c->readers = c->verified = 0; return c; }
+        if (c) { c->rollback = NULL; c->close_update = c->readers = c->verified = c->journaled = 0; return c; }
         c = v->clean_tail;
     }
     if (c) { unlink_clean(v, c); unindex_block(v, c); }
-    if (c) { c->rollback = NULL; c->close_update = c->readers = c->verified = 0; }
+    if (c) { c->rollback = NULL; c->close_update = c->readers = c->verified = c->journaled = 0; }
     return c;
 }
 static void retain_clean(struct ffs_volume *v, struct ffs_change *c)
@@ -116,6 +120,12 @@ static void unlink_pending(struct ffs_volume *v, struct ffs_change *c)
     if (c->previous) c->previous->next = c->next; else v->pending = c->next;
     if (c->next) c->next->previous = c->previous;
     --v->pending_count;
+}
+static void link_pending(struct ffs_volume *v, struct ffs_change *c)
+{
+    c->state = BLOCK_PENDING; c->previous = NULL; c->next = v->pending;
+    if (c->next) c->next->previous = c;
+    v->pending = c; ++v->pending_count;
 }
 static unsigned deferred_metadata(struct ffs_volume *v,
                                   const struct ffs_file_state *state)
@@ -246,7 +256,7 @@ static int read_block(struct ffs_volume *v, uint32_t key,
             c = v->clean_tail; unlink_clean(v, c); unindex_block(v, c);
         }
         if (c) {
-            c->key = key; c->rollback = NULL; c->close_update = c->readers = 0;
+            c->key = key; c->rollback = NULL; c->close_update = c->readers = c->journaled = 0;
             c->verified = !!checksum;
             memcpy(c->bytes, p, v->block_size);
             index_block(v, c); link_clean(v, c);
@@ -266,19 +276,69 @@ static void drop_root_image(struct ffs_volume *v)
 {
     release(v, v->root_image); v->root_image = NULL;
 }
+/* A block taken in place gets the rollback copy it skipped: its current
+ * bytes with the journaled ranges restored, pending in its stead. */
+static int materialize(struct ffs_volume *v, struct ffs_change *c)
+{
+    struct ffs_change *r = new_block(v);
+    unsigned i;
+    if (!r) return FFS_NOMEM;
+    memcpy(r->bytes, c->bytes, v->block_size);
+    for (i = v->undo_count; i--;)
+        if (v->undo[i].block == c)
+            memcpy(r->bytes + v->undo[i].offset, v->undo_bytes + v->undo[i].at, v->undo[i].length);
+    r->key = c->key; r->close_update = c->close_update;
+    r->checksum = c->saved_checksum; r->verified = c->saved_verified;
+    link_pending(v, r);
+    c->rollback = r; c->journaled = 0;
+    return 0;
+}
+/* Callers of the journaled edits record each range before writing it;
+ * other changes to such a block first materialize its rollback copy. */
+static int journal(struct ffs_volume *v, struct ffs_change *c, uint32_t offset, uint32_t length)
+{
+    struct ffs_undo *u;
+    const unsigned char *from;
+    unsigned char *to;
+    if (!c->journaled) return 0;
+    if (!v->undo_bytes) v->undo_bytes = v->io.alloc(v->io.context, v->block_size);
+    if (!v->undo_bytes || v->undo_count == sizeof(v->undo) / sizeof(*v->undo) ||
+        length > v->block_size - v->undo_used)
+        return materialize(v, c);
+    u = &v->undo[v->undo_count++];
+    u->block = c; u->offset = (uint16_t)offset; u->length = (uint16_t)length;
+    u->at = (uint16_t)v->undo_used;
+    to = v->undo_bytes + v->undo_used; from = c->bytes + offset;
+    v->undo_used += length;
+    /* Short ranges are words and timestamps; every journaled range is even. */
+    if (length > 12) memcpy(to, from, length);
+    else {
+        for (; length >= 4; length -= 4, to += 4, from += 4) put_word(to, word(from, 0));
+        if (length) { to[0] = from[0]; to[1] = from[1]; }
+    }
+    return 0;
+}
 /* Clean blocks become operation-owned in place. Pending blocks need an
- * unindexed rollback copy until the ordinary mutation succeeds. */
+ * unindexed rollback copy until the ordinary mutation succeeds, unless the
+ * caller journals its edits: then they are taken in place as well. */
 static int acquire_change(struct ffs_volume *v, uint32_t key,
                           struct ffs_change **result, int checksum,
-                          unsigned clear, unsigned read)
+                          unsigned clear, unsigned read, unsigned journaled)
 {
     struct ffs_change *old, *c;
     int err = 0;
     if (!valid_key(v, key)) return FFS_CORRUPT;
     old = cached_block(v, key);
     if (old && old->readers) return FFS_CORRUPT;
-    if (old && old->state == BLOCK_CHANGE) c = old;
-    else {
+    if (old && old->state == BLOCK_CHANGE) {
+        c = old;
+        if (c->journaled && (!journaled || clear)) err = materialize(v, c);
+        if (err) return err;
+    } else if (old && old->state == BLOCK_PENDING && journaled && !clear && v->deferred) {
+        c = old; unlink_pending(v, c);
+        c->journaled = 1; c->saved_checksum = c->checksum; c->saved_verified = c->verified;
+        c->state = BLOCK_CHANGE; c->next = v->changes; v->changes = c;
+    } else {
         if (old && old->state == BLOCK_CLEAN) {
             c = old; unlink_clean(v, c);
             if (read && !clear) err = check_cached(v, c, checksum >= 0);
@@ -310,23 +370,29 @@ static int edit_block(struct ffs_volume *v, uint32_t key, unsigned char **bytes,
                       int checksum, unsigned clear)
 {
     struct ffs_change *c;
-    int err = acquire_change(v, key, &c, checksum, clear, 1);
+    int err = acquire_change(v, key, &c, checksum, clear, 1, 0);
     if (err) return err;
     *bytes = c->bytes;
     return 0;
 }
+static int edit_journaled(struct ffs_volume *v, uint32_t key, struct ffs_change **result,
+                          int checksum)
+{
+    return acquire_change(v, key, result, checksum, 0, 1, 1);
+}
 /* Consume a sole read view when a scan finds the block to edit. A detached
- * read cell already owns its bytes; pending cells keep ordinary rollback. */
-static int edit_view(struct ffs_volume *v, struct block_view *view,
-                      unsigned char **bytes, int checksum)
+ * read cell already owns its bytes; pending cells keep ordinary rollback,
+ * or are taken in place for a journaling caller. */
+static int view_change(struct ffs_volume *v, struct block_view *view,
+                       struct ffs_change **result, int checksum, unsigned journaled)
 {
     struct ffs_change *c = view->block;
     if (!c || c->readers != 1) return FFS_CORRUPT;
     c->readers = 0; view->block = NULL; view->bytes = NULL;
-    if (c->state != BLOCK_READ) return edit_block(v, c->key, bytes, checksum, 0);
+    if (c->state != BLOCK_READ) return acquire_change(v, c->key, result, checksum, 0, 1, journaled);
     c->state = BLOCK_CHANGE; c->checksum = checksum; c->verified = 0;
     c->next = v->changes; v->changes = c;
-    *bytes = c->bytes;
+    *result = c;
     return 0;
 }
 /* Streaming writes acquire mutable metadata once. Operation-owned buffers
@@ -352,12 +418,12 @@ static int write_edit(struct ffs_volume *v, uint32_t key,
     }
 #ifdef FFS_PROFILE
     {
-        int err = acquire_change(v, key, result, checksum, clear, 1);
+        int err = acquire_change(v, key, result, checksum, clear, 1, 0);
         PROFILE_END(v, FFS_P_EDIT);
         return err;
     }
 #else
-    return acquire_change(v, key, result, checksum, clear, 1);
+    return acquire_change(v, key, result, checksum, clear, 1, 0);
 #endif
 }
 static int header(struct ffs_volume *v, uint32_t key, unsigned char *p)
@@ -804,7 +870,7 @@ static int stage_impl(struct ffs_volume *v, uint32_t key, unsigned char *p, int 
     struct ffs_change *c;
     int err;
     if (!valid_key(v, key)) return FFS_CORRUPT;
-    err = acquire_change(v, key, &c, checksum, 0, 0);
+    err = acquire_change(v, key, &c, checksum, 0, 0, 0);
     if (err) return err;
     if (c->bytes != p) memcpy(c->bytes, p, v->block_size);
     return 0;
@@ -895,13 +961,30 @@ static void abort_changes(struct ffs_volume *v)
     release_records(v, 0);
     if (v->direct && v->direct != v->direct_inline) v->io.free(v->io.context, v->direct, v->direct_capacity * sizeof(*v->direct));
     v->direct = NULL; v->direct_count = v->direct_capacity = 0;
+    /* Journaled ranges are restored newest first; their blocks stay pending. */
+    while (v->undo_count) {
+        struct ffs_undo *u = &v->undo[--v->undo_count];
+        if (u->block->journaled)
+            memcpy(u->block->bytes + u->offset, v->undo_bytes + u->at, u->length);
+    }
+    v->undo_used = 0;
     while ((c = v->changes)) {
         v->changes = c->next;
+        if (c->journaled) {
+            c->journaled = 0; c->checksum = c->saved_checksum; c->verified = c->saved_verified;
+            link_pending(v, c);
+            continue;
+        }
         unindex_block(v, c);
         if (c->rollback) index_block(v, c->rollback);
         free_block(v, c);
     }
-    if (!v->pending) drop_root_image(v);
+    if (!v->pending) {
+        /* Only pending blocks are journaled; an idle volume holds no buffer. */
+        drop_root_image(v);
+        if (v->undo_bytes) v->io.free(v->io.context, v->undo_bytes, v->block_size);
+        v->undo_bytes = NULL;
+    }
 }
 static void refresh_date(struct ffs_volume *v)
 {
@@ -1196,13 +1279,14 @@ static int finish_change(struct ffs_volume *v, int err)
     release_records(v, 1);
     if (v->direct && v->direct != v->direct_inline) v->io.free(v->io.context, v->direct, v->direct_capacity * sizeof(*v->direct));
     v->direct = NULL; v->direct_count = v->direct_capacity = 0;
+    v->undo_count = v->undo_used = 0;
     while ((c = v->changes)) {
         v->changes = c->next;
         if (c->rollback) {
             unlink_pending(v, c->rollback); free_block(v, c->rollback);
             c->rollback = NULL;
         }
-        ++v->pending_count; c->state = BLOCK_PENDING;
+        ++v->pending_count; c->state = BLOCK_PENDING; c->journaled = 0;
         c->previous = NULL; c->next = v->pending;
         if (c->next) c->next->previous = c;
         v->pending = c;
@@ -1297,21 +1381,22 @@ static uint32_t bitmap_bit(const struct ffs_volume *v, uint32_t key, uint32_t *p
 static int bitmap_change(struct ffs_volume *v, uint32_t key, unsigned make_free)
 {
     uint32_t page, mapkey = 0, bit, value, offset;
-    unsigned char *p;
+    struct ffs_change *c;
     int err;
     if (!valid_key(v, key) || key == v->root) return FFS_CORRUPT;
     bit = bitmap_bit(v, key, &page);
     err = bitmap_key(v, page, &mapkey);
     if (err) return err;
     if (key == mapkey) return FFS_CORRUPT;
-    err = edit_block(v, mapkey, &p, 0, 0);
+    err = edit_journaled(v, mapkey, &c, 0);
     offset = 4 + bit / 32 * 4;
     if (!err) {
-        value = word(p, offset);
+        value = word(c->bytes, offset);
         if (!!(value & (UINT32_C(1) << (bit % 32))) == !!make_free) err = FFS_CORRUPT;
-        else {
+        else err = journal(v, c, offset, 4);
+        if (!err) {
             value ^= UINT32_C(1) << (bit % 32);
-            put_word(p + offset, value);
+            put_word(c->bytes + offset, value);
             v->free_change += make_free ? 1 : UINT32_MAX;
         }
     }
@@ -1321,7 +1406,8 @@ static int bitmap_change(struct ffs_volume *v, uint32_t key, unsigned make_free)
 static int allocate_block_impl(struct ffs_volume *v, uint32_t *key)
 {
     struct block_view view = {NULL, NULL};
-    unsigned char *p;
+    struct ffs_change *c;
+    uint32_t offset;
     uint32_t page, mapkey = 0;
     uint32_t start = valid_key(v, v->alloc_hint) ? v->alloc_hint : v->reserved;
     uint32_t candidate, limit, bit, loaded = UINT32_MAX;
@@ -1339,10 +1425,12 @@ static int allocate_block_impl(struct ffs_volume *v, uint32_t *key)
                 loaded = page;
             }
             if (!err && (word(view.bytes, 4 + bit / 32 * 4) & (UINT32_C(1) << (bit % 32)))) {
+                offset = 4 + bit / 32 * 4;
                 if (candidate == mapkey || candidate == v->root) err = FFS_CORRUPT;
-                else err = edit_view(v, &view, &p, 0);
-                if (!err) put_word(p + 4 + bit / 32 * 4,
-                    word(p, 4 + bit / 32 * 4) & ~(UINT32_C(1) << (bit % 32)));
+                else err = view_change(v, &view, &c, 0, 1);
+                if (!err) err = journal(v, c, offset, 4);
+                if (!err) put_word(c->bytes + offset,
+                    word(c->bytes, offset) & ~(UINT32_C(1) << (bit % 32)));
                 if (!err) {
                     cancel_release(v, candidate); *key = candidate; v->alloc_hint = candidate + 1;
                     --v->free_change;
@@ -1502,6 +1590,7 @@ static int change_cache_position(struct ffs_volume *v, uint32_t dir, uint32_t ke
 {
     struct ffs_entry e, target;
     struct block_view view = {NULL, NULL};
+    struct ffs_change *cell;
     const unsigned char *scan;
     unsigned char record[134], *p;
     uint32_t current, seen = 0, offset, length, entries, i, found, found_length;
@@ -1554,8 +1643,11 @@ static int change_cache_position(struct ffs_volume *v, uint32_t dir, uint32_t ke
         used = offset;
         if (found) {
             if (mode >= 0 && record_length != found_length) break;
-            err = edit_view(v, &view, &p, 20);
+            err = view_change(v, &view, &cell, 20, 1);
+            if (!err) err = journal(v, cell, 12, 4);
+            if (!err) err = journal(v, cell, found, mode < 0 ? used - found : record_length);
             if (err) break;
+            p = cell->bytes;
             if (mode < 0) {
                 /* Records are even-aligned and longer than a word. */
                 for (i = found; i + 4 <= used - found_length; i += 4)
@@ -1568,8 +1660,11 @@ static int change_cache_position(struct ffs_volume *v, uint32_t dir, uint32_t ke
             return 0;
         }
         if (mode > 0 && record_length <= v->block_size - used) {
-            err = edit_view(v, &view, &p, 20);
+            err = view_change(v, &view, &cell, 20, 1);
+            if (!err) err = journal(v, cell, 12, 4);
+            if (!err) err = journal(v, cell, used, record_length);
             if (err) break;
+            p = cell->bytes;
             memcpy(p + used, record, record_length);
             put_word(p + 12, entries + 1);
             return 0;
@@ -1586,9 +1681,11 @@ static int change_cache(struct ffs_volume *v, uint32_t dir, uint32_t key, int mo
 }
 static int insert_entry(struct ffs_volume *v, uint32_t dir, uint32_t key, unsigned char *p)
 {
-    unsigned char *parent;
+    struct ffs_change *c;
+    unsigned char *parent = NULL;
     uint16_t hash = 0;
-    int err = edit_block(v, dir, &parent, 20, 0);
+    int err = edit_journaled(v, dir, &c, 20);
+    if (!err) parent = c->bytes;
     if (!err && (word(parent, 0) != 2 || word(parent, 4) != (dir == v->root ? 0 : dir)))
         err = FFS_CORRUPT;
     if (!err && word(parent, v->block_size - 4) != 1 &&
@@ -1599,8 +1696,12 @@ static int insert_entry(struct ffs_volume *v, uint32_t dir, uint32_t key, unsign
         put_word(p + v->block_size - 16, word(parent, 24 + hash * 4));
         put_word(p + v->block_size - 12, dir);
         err = stage(v, key, p, 20);
-        put_word(parent + 24 + hash * 4, key);
-        stamp(v, parent);
+        if (!err) err = journal(v, c, 24 + hash * 4, 4);
+        if (!err) err = journal(v, c, v->block_size - 92, 12);
+        if (!err) {
+            put_word(parent + 24 + hash * 4, key);
+            stamp(v, parent);
+        }
     }
     return err;
 }
@@ -2169,7 +2270,7 @@ static int prepare_ofs_run(struct ffs_volume *v, uint32_t file, uint32_t block,
         /* A cell this operation already owns can only be aliased metadata. */
         if (c && (c->state == BLOCK_CHANGE || (base >= old_size && c->state != BLOCK_CLEAN)))
             return FFS_CORRUPT;
-        err = acquire_change(v, block, &c, 20, base >= old_size, base < old_size);
+        err = acquire_change(v, block, &c, 20, base >= old_size, base < old_size, 0);
         if (err) return err;
         p = c->bytes;
         if (base < old_size && (word(p, 0) != 8 || word(p, 4) != file ||
@@ -2405,7 +2506,7 @@ int ffs_write_file(struct ffs_volume *v, struct ffs_file_state *state, uint32_t 
 static int unlink_entry(struct ffs_volume *v, const struct ffs_entry *e)
 {
     struct block_view view;
-    unsigned char *p;
+    struct ffs_change *c;
     uint16_t hash = 0;
     uint32_t owner = e->parent, offset, next, seen = 0;
     int err;
@@ -2418,10 +2519,12 @@ static int unlink_entry(struct ffs_volume *v, const struct ffs_entry *e)
     while (!err) {
         next = word(view.bytes, offset);
         if (next == e->key) {
-            err = edit_view(v, &view, &p, 20);
+            err = view_change(v, &view, &c, 20, 1);
+            if (!err) err = journal(v, c, offset, 4);
+            if (!err && owner == e->parent) err = journal(v, c, v->block_size - 92, 12);
             if (!err) {
-                put_word(p + offset, e->hash_next);
-                if (owner == e->parent) stamp(v, p);
+                put_word(c->bytes + offset, e->hash_next);
+                if (owner == e->parent) stamp(v, c->bytes);
             }
             break;
         }
@@ -2451,6 +2554,7 @@ static int release_cached(struct ffs_volume *v, uint32_t first, uint32_t count)
 static int free_run(struct ffs_volume *v, uint32_t first, uint32_t count)
 {
     uint32_t bits = (v->block_size - 4) * 8, bit, n, mapkey = 0, offset, amount, mask, value, page;
+    struct ffs_change *c;
     unsigned char *p;
     int err;
     if (first < v->reserved || first >= v->blocks || count > v->blocks - first ||
@@ -2460,8 +2564,10 @@ static int free_run(struct ffs_volume *v, uint32_t first, uint32_t count)
         n = bits - bit < count ? bits - bit : count;
         err = bitmap_key(v, page, &mapkey);
         if (!err && mapkey - first < n) err = FFS_CORRUPT;
-        if (!err) err = edit_block(v, mapkey, &p, 0, 0);
+        if (!err) err = edit_journaled(v, mapkey, &c, 0);
+        if (!err) err = journal(v, c, 4 + bit / 32 * 4, (bit % 32 + n + 31) / 32 * 4);
         if (err) return err;
+        p = c->bytes;
         for (offset = 4 + bit / 32 * 4, bit %= 32, amount = 0; amount < n; offset += 4, bit = 0) {
             uint32_t width = 32 - bit < n - amount ? 32 - bit : n - amount;
             mask = (UINT32_MAX >> (32 - width)) << bit;

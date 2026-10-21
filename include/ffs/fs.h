@@ -37,6 +37,9 @@ struct ffs_io {
 struct ffs_data_run { uint32_t key, size, blocks, index, next; const unsigned char *data; };
 /* Blocks freed by the current operation, retired when it succeeds. */
 struct ffs_released { struct ffs_released *next; unsigned count; uint32_t keys[32]; };
+/* A range of a pending block edited in place; its prior bytes are kept at
+ * offset `at` of the volume's undo buffer until the operation ends. */
+struct ffs_undo { struct ffs_change *block; uint16_t offset, length, at; };
 struct ffs_volume {
     struct ffs_io io;
     struct ffs_format format;
@@ -67,6 +70,9 @@ struct ffs_volume {
      * remain readable and may be overwritten in place or shrunk. */
     uint32_t file_limit;
     unsigned in_place;
+    struct ffs_undo undo[16];
+    unsigned undo_count, undo_used;
+    unsigned char *undo_bytes;
 #ifdef FFS_PROFILE
     struct ffs_profile profile;
     uint32_t (*clock)(void *);
