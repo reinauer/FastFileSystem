@@ -73,6 +73,9 @@ struct ffs_volume {
     struct ffs_undo undo[16];
     unsigned undo_count, undo_used;
     unsigned char *undo_bytes;
+    /* The last entry found by name, and its hash, until the next mutation. */
+    uint32_t hash_key, hash_generation;
+    uint16_t hash_value;
 #ifdef FFS_PROFILE
     struct ffs_profile profile;
     uint32_t (*clock)(void *);
@@ -83,9 +86,10 @@ struct ffs_file_state {
     uint32_t key, table, table_start, generation, cache_block, cache_offset;
     unsigned defer_metadata;
 };
+/* generation is the volume's when the entry was decoded. */
 struct ffs_entry {
     uint32_t key, parent, size, protection, days, minutes, ticks;
-    uint32_t link, hash_next, backlink, owner;
+    uint32_t link, hash_next, backlink, owner, generation;
     int32_t type;
     unsigned char name[31], comment[80];
 };
@@ -131,6 +135,9 @@ int ffs_write_file(struct ffs_volume *, struct ffs_file_state *, uint32_t key,
                    uint32_t offset, const void *, uint32_t length, uint32_t *actual);
 int ffs_resize(struct ffs_volume *, uint32_t key, uint32_t size);
 int ffs_remove(struct ffs_volume *, uint32_t key);
+/* Removes a looked-up entry, decoding its header again only if the volume
+ * changed since the lookup. */
+int ffs_remove_entry(struct ffs_volume *, const struct ffs_entry *);
 int ffs_rename(struct ffs_volume *, uint32_t key, uint32_t directory, const char *name);
 int ffs_set_metadata(struct ffs_volume *, uint32_t key, const struct ffs_entry *);
 int ffs_free_blocks(struct ffs_volume *, uint32_t *count);

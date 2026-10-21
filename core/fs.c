@@ -464,6 +464,7 @@ static int decode_entry(struct ffs_volume *v, uint32_t key,
     if (!e) return 0;
     /* Every field is assigned; strings end at their recorded lengths. */
     e->key = key;
+    e->generation = v->generation;
     e->type = type;
     e->parent = word(p, size - 12);
     e->hash_next = word(p, size - 16);
@@ -580,6 +581,9 @@ int ffs_lookup(struct ffs_volume *v, uint32_t dir, const unsigned char *name,
         }
         release_view(v, &view);
         if (err || match) break;
+    }
+    if (!err && key) {
+        v->hash_key = key; v->hash_generation = v->generation; v->hash_value = hash;
     }
     return err ? err : key ? 0 : FFS_NOT_FOUND;
 }
@@ -2510,8 +2514,10 @@ static int unlink_entry(struct ffs_volume *v, const struct ffs_entry *e)
     uint16_t hash = 0;
     uint32_t owner = e->parent, offset, next, seen = 0;
     int err;
-    (void)ffs_name_hash(e->name, strlen((char *)e->name), v->format.international,
-                       (uint16_t)v->buckets, &hash);
+    /* Removal usually follows a lookup of the same name. */
+    if (e->key == v->hash_key && v->hash_generation == v->generation) hash = v->hash_value;
+    else (void)ffs_name_hash(e->name, strlen((char *)e->name), v->format.international,
+                            (uint16_t)v->buckets, &hash);
     offset = 24 + 4 * hash;
     err = header_view(v, owner, &view);
     if (!err && word(view.bytes, v->block_size - 4) != 1 &&
@@ -2647,9 +2653,13 @@ static int truncate_file(struct ffs_volume *v, uint32_t key, uint32_t old_size,
     }
     return err;
 }
-int ffs_remove(struct ffs_volume *v, uint32_t key)
+/* A found entry stands in for the header while the volume's generation is
+ * unchanged: only in-place close updates intervene, and they change no
+ * field used here-> */
+static int remove_entry(struct ffs_volume *v, uint32_t key, const struct ffs_entry *found)
 {
-    struct ffs_entry e, child;
+    struct ffs_entry decoded, child;
+    const struct ffs_entry *e = &decoded;
     struct ffs_iterator it = {0, 0, 0, 0};
     unsigned char *p = NULL;
     uint32_t cache = 0, next, seen = 0;
@@ -2658,36 +2668,37 @@ int ffs_remove(struct ffs_volume *v, uint32_t key)
     err = finish_file(v, key);
     if (!err) err = begin_write(v);
     if (err) return err;
-    err = ffs_stat(v, key, &e);
-    if (!err && (key == v->root || (e.protection & 1))) err = FFS_DELETE_PROTECTED;
-    if (!err && (e.type == -4 || e.type == 4 || e.backlink)) {
+    if (found && found->generation == v->generation) e = found;
+    else err = ffs_stat(v, key, &decoded);
+    if (!err && (key == v->root || (e->protection & 1))) err = FFS_DELETE_PROTECTED;
+    if (!err && (e->type == -4 || e->type == 4 || e->backlink)) {
         struct ffs_entry other;
         unsigned char *linked = buffer(v);
-        uint32_t owner = e.link;
+        uint32_t owner = e->link;
         p = buffer(v);
         if (!linked || !p) err = FFS_NOMEM;
-        if (!err && e.link) {
+        if (!err && e->link) {
             /* Unlink a hard-link header from its target's backlink list. */
             for (seen = 0; !err; ++seen) {
                 if (seen >= v->blocks) { err = FFS_CORRUPT; break; }
                 err = header(v, owner, p);
                 if (err) break;
                 if (word(p, v->block_size - 40) == key) {
-                    put_word(p + v->block_size - 40, e.backlink);
+                    put_word(p + v->block_size - 40, e->backlink);
                     err = stage(v, owner, p, 20); break;
                 }
                 owner = word(p, v->block_size - 40);
             }
-            if (!err) err = unlink_entry(v, &e);
+            if (!err) err = unlink_entry(v, e);
             if (!err) err = bitmap_change(v, key, 1);
-            if (!err) err = change_cache(v, e.parent, key, -1);
+            if (!err) err = change_cache(v, e->parent, key, -1);
         } else if (!err) {
             /* Keep the real header key (OFS data and children refer to it),
              * and move it into the first link's directory/name slot. */
-            err = ffs_stat(v, e.backlink, &other);
+            err = ffs_stat(v, e->backlink, &other);
             if (!err && other.link != key) err = FFS_CORRUPT;
             if (!err) err = header(v, other.key, linked);
-            if (!err) err = unlink_entry(v, &e);
+            if (!err) err = unlink_entry(v, e);
             if (!err) err = unlink_entry(v, &other);
             if (!err) err = header(v, key, p);
             if (!err) {
@@ -2699,13 +2710,13 @@ int ffs_remove(struct ffs_volume *v, uint32_t key)
                 err = insert_entry(v, other.parent, key, p);
             }
             if (!err) err = bitmap_change(v, other.key, 1);
-            if (!err) err = directory_cache(v, e.parent);
+            if (!err) err = directory_cache(v, e->parent);
             if (!err) err = object_caches(v, key);
         }
         release(v, linked); release(v, p);
         return finish_change(v, err);
     }
-    if (!err && e.type == 2) {
+    if (!err && e->type == 2) {
         err = ffs_next(v, key, &it, &child);
         if (!err) err = FFS_NOT_EMPTY;
         else if (err == FFS_NO_MORE) err = 0;
@@ -2722,13 +2733,21 @@ int ffs_remove(struct ffs_volume *v, uint32_t key)
             }
             next = word(p, 16); err = bitmap_change(v, cache, 1); cache = next;
         }
-    } else if (!err && e.type == -3) err = truncate_file(v, key, e.size, 0, 1);
-    else if (!err && e.type != 3) err = FFS_WRONG_TYPE;
-    if (!err) err = unlink_entry(v, &e);
+    } else if (!err && e->type == -3) err = truncate_file(v, key, e->size, 0, 1);
+    else if (!err && e->type != 3) err = FFS_WRONG_TYPE;
+    if (!err) err = unlink_entry(v, e);
     if (!err) err = bitmap_change(v, key, 1);
-    if (!err) err = change_cache(v, e.parent, key, -1);
+    if (!err) err = change_cache(v, e->parent, key, -1);
     release(v, p);
     return finish_change(v, err);
+}
+int ffs_remove(struct ffs_volume *v, uint32_t key)
+{
+    return remove_entry(v, key, NULL);
+}
+int ffs_remove_entry(struct ffs_volume *v, const struct ffs_entry *e)
+{
+    return remove_entry(v, e->key, e);
 }
 int ffs_rename(struct ffs_volume *v, uint32_t key, uint32_t dir, const char *name)
 {

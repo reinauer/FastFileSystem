@@ -1330,7 +1330,7 @@ static void dispatch(struct handler *h, struct DosPacket *pkt)
         if (!err) err = ffs_lookup(&h->fs, key, (unsigned char *)leaf, strlen(leaf), &entry);
         if (!err && in_use(h, entry.key)) err = ERROR_OBJECT_IN_USE;
         if (!err) changed(h, entry.key);
-        if (!err && pkt->dp_Type == ACTION_DELETE_OBJECT) err = ffs_remove(&h->fs, entry.key);
+        if (!err && pkt->dp_Type == ACTION_DELETE_OBJECT) err = ffs_remove_entry(&h->fs, &entry);
         else if (!err) {
             from_bstr(name, pkt->dp_Arg4);
             err = parent_name(h, pkt->dp_Arg3, name, &key, &leaf);
