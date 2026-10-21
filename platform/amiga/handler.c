@@ -37,6 +37,10 @@
 #include <proto/timer.h>
 #endif
 
+/* Found by the Version command; bump the date with each release. */
+static const char version[] __attribute__((__used__)) =
+    "$VER: FastFileSystem 1.0 (20.10.2026)";
+
 /* Device addressing for the partition. */
 enum { IO32, IO64_TD64, IO64_NSD };
 struct file_lock {
