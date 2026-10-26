@@ -267,6 +267,13 @@ static unsigned resize_cache(struct handler *h, unsigned count)
     h->cache_count = ffs_cache_resize(&h->fs, count);
     return h->cache_count;
 }
+/* NDK 3.2 prefixes the query result fields with nsdqr_; the OS4 SDK does
+ * not. */
+#ifdef __amigaos4__
+#define nsdqr_SizeAvailable SizeAvailable
+#define nsdqr_DeviceType DeviceType
+#define nsdqr_SupportedCommands SupportedCommands
+#endif
 /* Prefer NSD, which the device must list, then probe TD64 with a transfer
  * of zero bytes. */
 static unsigned query_io64(struct handler *h, ULONG flags)
@@ -279,9 +286,9 @@ static unsigned query_io64(struct handler *h, ULONG flags)
         h->request->io_Command = NSCMD_DEVICEQUERY;
         h->request->io_Data = &result; h->request->io_Length = sizeof(result);
         if (!DoIO((struct IORequest *)h->request) && h->request->io_Actual >= 16 &&
-            result.SizeAvailable == h->request->io_Actual &&
-            result.DeviceType == NSDEVTYPE_TRACKDISK && result.SupportedCommands)
-            for (command = result.SupportedCommands; *command; ++command) {
+            result.nsdqr_SizeAvailable == h->request->io_Actual &&
+            result.nsdqr_DeviceType == NSDEVTYPE_TRACKDISK && result.nsdqr_SupportedCommands)
+            for (command = result.nsdqr_SupportedCommands; *command; ++command) {
                 if (*command == NSCMD_TD_READ64) reads = 1;
                 if (*command == NSCMD_TD_WRITE64) writes = 1;
             }
