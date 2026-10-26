@@ -770,7 +770,7 @@ static void fill_fib(const struct ffs_entry *entry, struct FileInfoBlock *fib)
     fib->fib_Date.ds_Days = entry->days;
     fib->fib_Date.ds_Minute = entry->minutes;
     fib->fib_Date.ds_Tick = entry->ticks;
-    /* BSTRs followed by the name's terminator. */
+    /* BSTRs followed by their terminators. */
     length = strlen((const char *)entry->name);
     fib->fib_FileName[0] = (char)length;
     /* A 107-byte name fills the field; its terminator would not fit. */
@@ -778,8 +778,9 @@ static void fill_fib(const struct ffs_entry *entry, struct FileInfoBlock *fib)
            length < sizeof(fib->fib_FileName) - 1 ? length + 1 : length);
     length = strlen((const char *)entry->comment);
     fib->fib_Comment[0] = (char)length;
-    if (length) memcpy(fib->fib_Comment + 1, entry->comment, length);
-    fib->fib_Comment[length + 1] = 0;
+    /* So does a 79-byte comment. */
+    memcpy(fib->fib_Comment + 1, entry->comment,
+           length < sizeof(fib->fib_Comment) - 1 ? length + 1 : length);
 }
 static int parent_name(struct handler *h, BPTR lock, char *path,
                          uint32_t *parent, char **name)
