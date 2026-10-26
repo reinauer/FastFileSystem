@@ -875,7 +875,10 @@ int ffs_read(struct ffs_volume *v, uint32_t key, uint32_t offset, void *data,
         if (n >= word(p, 8) || word(p, 8) > v->buckets) { err = FFS_CORRUPT; break; }
         data_key = word(p, 24 + (v->buckets - 1 - n) * 4);
         if (!valid_key(v, data_key)) { err = FFS_CORRUPT; break; }
-        extent = v->io.read_extent && !v->changes && !v->pending && !within && length >= capacity;
+        /* Pending cells hold bytes the disk lacks; those blocks are read
+         * from the cell, and an extent ends before the next pending block. */
+        extent = v->io.read_extent && !v->changes && !within && length >= capacity &&
+                 !(v->pending && pending_block(v, data_key));
         /* OFS blocks carry headers, so their runs go through a transfer
          * buffer of at most 16 KiB and are checked block by block. */
         if (extent && !v->format.fast && !transfer) {
@@ -897,7 +900,8 @@ int ffs_read(struct ffs_volume *v, uint32_t key, uint32_t offset, void *data,
             if (limit > v->blocks - data_key) limit = v->blocks - data_key;
             if (!v->format.fast && limit > transfer_blocks) limit = transfer_blocks;
             /* Table slots run downward; count successive keys. */
-            while (run < limit && word(slot, 0) == next) { ++run; ++next; slot -= 4; }
+            while (run < limit && word(slot, 0) == next &&
+                   !(v->pending && pending_block(v, next))) { ++run; ++next; slot -= 4; }
             if (v->format.fast) {
                 amount = run << v->block_shift;
                 if (v->io.read_extent(v->io.context, data_key, out, amount)) {
