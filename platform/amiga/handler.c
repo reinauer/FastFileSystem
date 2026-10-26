@@ -637,14 +637,20 @@ static int lock_key(struct handler *h, BPTR bptr, uint32_t *key)
     *key = p->dos.fl_Key;
     return 0;
 }
+/* Whether an outstanding lock conflicts with access of the given mode. */
+static int in_use(struct handler *h, uint32_t key, LONG mode)
+{
+    struct file_lock *p;
+    for (p = h->locks; p; p = p->next)
+        if ((uint32_t)p->dos.fl_Key == key &&
+            (mode == EXCLUSIVE_LOCK || p->dos.fl_Access == EXCLUSIVE_LOCK)) return 1;
+    return 0;
+}
 static int new_lock(struct handler *h, uint32_t key, LONG mode, BPTR *result)
 {
     struct file_lock *p;
     if (mode != SHARED_LOCK && mode != EXCLUSIVE_LOCK) return ERROR_INVALID_LOCK;
-    for (p = h->locks; p; p = p->next)
-        if ((uint32_t)p->dos.fl_Key == key &&
-            (mode == EXCLUSIVE_LOCK || p->dos.fl_Access == EXCLUSIVE_LOCK))
-            return ERROR_OBJECT_IN_USE;
+    if (in_use(h, key, mode)) return ERROR_OBJECT_IN_USE;
     p = spare_alloc(h, &h->spare_locks, sizeof(*p));
     if (!p) return ERROR_NO_FREE_STORE;
     p->dos.fl_Key = key; p->dos.fl_Access = mode;
@@ -807,15 +813,6 @@ static int parent_name(struct handler *h, BPTR lock, char *path,
         if (!err) *parent = e.key;
     }
     return err;
-}
-/* Whether an outstanding lock conflicts with access of the given mode. */
-static int in_use(struct handler *h, uint32_t key, LONG mode)
-{
-    struct file_lock *p;
-    for (p = h->locks; p; p = p->next)
-        if ((uint32_t)p->dos.fl_Key == key &&
-            (mode == EXCLUSIVE_LOCK || p->dos.fl_Access == EXCLUSIVE_LOCK)) return 1;
-    return 0;
 }
 static void send_notice(struct handler *h, struct watch *watch)
 {
