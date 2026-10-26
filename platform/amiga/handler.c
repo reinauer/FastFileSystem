@@ -800,11 +800,13 @@ static int parent_name(struct handler *h, BPTR lock, char *path,
     }
     return err;
 }
-static int in_use(struct handler *h, uint32_t key)
+/* Whether an outstanding lock conflicts with access of the given mode. */
+static int in_use(struct handler *h, uint32_t key, LONG mode)
 {
     struct file_lock *p;
     for (p = h->locks; p; p = p->next)
-        if ((uint32_t)p->dos.fl_Key == key) return 1;
+        if ((uint32_t)p->dos.fl_Key == key &&
+            (mode == EXCLUSIVE_LOCK || p->dos.fl_Access == EXCLUSIVE_LOCK)) return 1;
     return 0;
 }
 static void send_notice(struct handler *h, struct watch *watch)
@@ -1376,7 +1378,11 @@ static void dispatch(struct handler *h, struct DosPacket *pkt)
         /* parent_name resolves the lock itself. */
         err = parent_name(h, pkt->dp_Arg1, name, &key, &leaf);
         if (!err) err = ffs_lookup(&h->fs, key, (unsigned char *)leaf, strlen(leaf), &entry);
-        if (!err && in_use(h, entry.key)) err = ERROR_OBJECT_IN_USE;
+        /* Locks hold the header key, not the name. As in FastFileSystem 47,
+         * any lock prevents deletion, but only an exclusive one renaming. */
+        if (!err && in_use(h, entry.key,
+                           pkt->dp_Type == ACTION_DELETE_OBJECT ? EXCLUSIVE_LOCK : SHARED_LOCK))
+            err = ERROR_OBJECT_IN_USE;
         if (!err) changed(h, entry.key);
         if (!err && pkt->dp_Type == ACTION_DELETE_OBJECT) err = ffs_remove_entry(&h->fs, &entry);
         else if (!err) {
