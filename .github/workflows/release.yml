@@ -18,11 +18,11 @@ jobs:
         include:
           - name: OS3 and ffs-image
             artifact: os3
-            image: stefanreinauer/amiga-gcc:gcc-v13.4
+            image: stefanreinauer/amiga-gcc:gcc-v16.2
             targets: amigaos3 ffs-image
           - name: OS4
             artifact: os4
-            image: stefanreinauer/amigappc-gcc:latest
+            image: stefanreinauer/amiga-gcc:gcc-v16.2-ppc
             targets: amigaos4
 
     steps:
