@@ -770,6 +770,20 @@ static int next_cached(struct ffs_volume *v, uint32_t dir, struct ffs_iterator *
     it->next = 0; it->bucket = 24; it->index = 0;
     return FFS_NO_MORE;
 }
+/* A link shows its target's metadata under its own name and comment. */
+static int link_metadata(struct ffs_volume *v, struct ffs_entry *e)
+{
+    struct ffs_entry target;
+    int err;
+    if (e->type != -4 && e->type != 4) return 0;
+    err = ffs_stat(v, e->link, &target);
+    if (!err && target.type != (e->type == -4 ? -3 : 2)) err = FFS_CORRUPT;
+    if (!err) {
+        e->size = target.size; e->protection = target.protection; e->owner = target.owner;
+        e->days = target.days; e->minutes = target.minutes; e->ticks = target.ticks;
+    }
+    return err;
+}
 static int next_entry(struct ffs_volume *v, uint32_t dir, struct ffs_iterator *it,
                       struct ffs_entry *e, unsigned use_cache)
 {
@@ -778,7 +792,7 @@ static int next_entry(struct ffs_volume *v, uint32_t dir, struct ffs_iterator *i
     int err;
     if (use_cache && v->format.dircache && v->validated && !v->changes) {
         err = next_cached(v, dir, it, e);
-        goto links;
+        return err ? err : link_metadata(v, e);
     }
     if (!key) {
         err = header_view(v, dir, &view);
@@ -794,22 +808,148 @@ static int next_entry(struct ffs_volume *v, uint32_t dir, struct ffs_iterator *i
     err = ffs_stat(v, key, e);
     if (!err && e->parent != dir) err = FFS_CORRUPT;
     if (!err) it->next = e->hash_next;
-links:
-    if (!err && (e->type == -4 || e->type == 4)) {
-        struct ffs_entry target;
-        err = ffs_stat(v, e->link, &target);
-        if (!err && target.type != (e->type == -4 ? -3 : 2)) err = FFS_CORRUPT;
-        if (!err) {
-            e->size = target.size; e->protection = target.protection; e->owner = target.owner;
-            e->days = target.days; e->minutes = target.minutes; e->ticks = target.ticks;
-        }
-    }
-    return err;
+    return err ? err : link_metadata(v, e);
 }
 int ffs_next(struct ffs_volume *v, uint32_t dir, struct ffs_iterator *it,
              struct ffs_entry *e)
 {
     return next_entry(v, dir, it, e, 1);
+}
+static void scan_release(struct ffs_volume *v, struct ffs_scan *s)
+{
+    if (s->keys) v->io.free(v->io.context, s->keys, s->capacity * sizeof(*s->keys));
+    s->keys = NULL; s->capacity = s->count = s->position = 0;
+}
+void ffs_scan_end(struct ffs_volume *v, struct ffs_scan *s)
+{
+    scan_release(v, s);
+    memset(s, 0, sizeof(*s));
+}
+static void scan_restart(struct ffs_volume *v, struct ffs_scan *s)
+{
+    memset(&s->it, 0, sizeof(s->it));
+    s->count = s->position = s->previous = s->fixed = 0;
+    s->status = 0; s->generation = v->generation;
+}
+static int scan_add(struct ffs_volume *v, struct ffs_scan *s, uint32_t key)
+{
+    if (s->count == s->capacity) {
+        uint32_t capacity = s->capacity ? s->capacity * 2 : 64;
+        uint32_t *keys = v->io.alloc(v->io.context, capacity * sizeof(*keys));
+        if (!keys) return FFS_NOMEM;
+        if (s->keys) {
+            memcpy(keys, s->keys, s->count * sizeof(*keys));
+            v->io.free(v->io.context, s->keys, s->capacity * sizeof(*keys));
+        }
+        s->keys = keys; s->capacity = capacity;
+    }
+    s->keys[s->count++] = key;
+    return 0;
+}
+/* Advance the iterator, noting what it returns. */
+static int scan_forward(struct ffs_volume *v, uint32_t dir, struct ffs_scan *s,
+                        struct ffs_entry *e)
+{
+    int err;
+    s->before = s->it;
+    err = ffs_next(v, dir, &s->it, e);
+    if (!err) err = scan_add(v, s, e->key);
+    if (err) s->it = s->before;
+    else s->previous = e->key;
+    return err;
+}
+static void scan_sort(uint32_t *keys, uint32_t count)
+{
+    uint32_t gap = 1, i, j, key;
+    while (gap < count / 3) gap = gap * 3 + 1;
+    for (; gap; gap /= 3)
+        for (i = gap; i < count; ++i) {
+            key = keys[i];
+            for (j = i; j >= gap && keys[j - gap] > key; j -= gap) keys[j] = keys[j - gap];
+            keys[j] = key;
+        }
+}
+static int scan_returned(const uint32_t *keys, uint32_t count, uint32_t key)
+{
+    uint32_t low = 0, middle;
+    while (low < count) {
+        middle = low + (count - low) / 2;
+        if (keys[middle] == key) return 1;
+        if (keys[middle] < key) low = middle + 1;
+        else count = middle;
+    }
+    return 0;
+}
+/* The volume changed, so the iterator may point anywhere. Fix what is left
+ * to return: the directory's entries now, less those already returned. */
+static void scan_fix(struct ffs_volume *v, uint32_t dir, struct ffs_scan *s)
+{
+    struct ffs_iterator it = {0, 0, 0, 0};
+    struct ffs_entry e;
+    uint32_t returned = s->count;
+    int err = 0;
+    scan_sort(s->keys, returned);
+    s->position = returned; s->fixed = 1; s->generation = v->generation;
+    while (!err) {
+        err = ffs_next(v, dir, &it, &e);
+        if (!err && !scan_returned(s->keys, returned, e.key)) err = scan_add(v, s, e.key);
+    }
+    s->status = err;
+}
+/* Decode a fixed key. After another change it may name an entry that has
+ * left: its header can survive unchanged, so only a lookup shows it is
+ * still linked here. */
+static int scan_child(struct ffs_volume *v, uint32_t dir, uint32_t key, unsigned changed,
+                      struct ffs_entry *e)
+{
+    struct ffs_entry found;
+    int err = ffs_stat(v, key, e);
+    if (!err && e->parent != dir) err = FFS_CORRUPT;
+    if (changed && err == FFS_CORRUPT) return FFS_NOT_FOUND;
+    if (!err && changed) {
+        err = ffs_lookup(v, dir, e->name, strlen((char *)e->name), &found);
+        if (!err && found.key != key) err = FFS_NOT_FOUND;
+    }
+    return err ? err : link_metadata(v, e);
+}
+int ffs_scan_next(struct ffs_volume *v, uint32_t dir, struct ffs_scan *s, uint32_t previous,
+                  struct ffs_entry *e)
+{
+    int err;
+    if (!v || !v->mounted || !s || !e) return FFS_CORRUPT;
+    if (previous == dir || previous != s->previous) {
+        scan_restart(v, s);
+        if (previous != dir) {
+            do err = scan_forward(v, dir, s, e);
+            while (!err && e->key != previous);
+            /* An entry that has left gives no position: start again rather
+             * than lose what follows it. */
+            if (err == FFS_NO_MORE) scan_restart(v, s);
+            else if (err) return err;
+        }
+    }
+    if (!s->fixed && !s->status && s->generation != v->generation) scan_fix(v, dir, s);
+    while (s->fixed && s->position < s->count) {
+        err = scan_child(v, dir, s->keys[s->position], s->generation != v->generation, e);
+        if (err == FFS_NOT_FOUND) { ++s->position; continue; }
+        if (err) return err;
+        s->previous = s->keys[s->position++];
+        return 0;
+    }
+    if (!s->fixed && !s->status) {
+        err = scan_forward(v, dir, s, e);
+        if (err != FFS_NO_MORE) return err;
+        s->status = err;
+    }
+    /* Further calls with this FileInfoBlock find the same end. */
+    scan_release(v, s);
+    return s->status;
+}
+void ffs_scan_again(struct ffs_scan *s, uint32_t previous)
+{
+    if (s->fixed) --s->position;
+    else { s->it = s->before; --s->count; }
+    s->previous = previous;
 }
 static int table_view(struct ffs_volume *v, uint32_t key, uint32_t file,
                       struct block_view *view)
