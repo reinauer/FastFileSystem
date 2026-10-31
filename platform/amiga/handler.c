@@ -55,8 +55,7 @@ enum { IO32, IO64_TD64, IO64_NSD };
 struct file_lock {
     struct FileLock dos;
     struct file_lock *next;
-    struct ffs_iterator iterator;
-    uint32_t previous, generation;
+    struct ffs_scan scan;
 };
 struct file_handle {
     struct file_handle *next;
@@ -675,6 +674,7 @@ static int free_lock(struct handler *h, BPTR lock)
             it->dos.fl_Link = it->next ? MKBADDR(&it->next->dos) : 0;
         h->volume->dol_misc.dol_volume.dol_LockList = h->locks ? MKBADDR(&h->locks->dos) : 0;
     }
+    ffs_scan_end(&h->fs, &found->scan);
     spare_free(&h->spare_locks, found);
     return 0;
 }
@@ -888,25 +888,21 @@ static int call_match(struct handler *h, struct Hook *hook, LONG *type,
     if (UtilityBase) CloseLibrary(UtilityBase);
     return result != 0;
 }
-static int examine_all(struct handler *h, uint32_t dir, struct DosPacket *pkt)
+static int examine_all(struct handler *h, uint32_t dir, struct ffs_scan *scan,
+                       struct DosPacket *pkt)
 {
     struct ExAllControl *control = (void *)pkt->dp_Arg5;
     struct ExAllData item, *last = NULL, *dest;
-    struct ffs_iterator it = {0, 0, 0, 0};
     struct ffs_entry e;
     unsigned char *out = (void *)pkt->dp_Arg2;
     uint32_t left = pkt->dp_Arg3, fixed, need, names, comments;
-    unsigned found = control->eac_LastKey == 0;
+    uint32_t previous = control->eac_LastKey ? control->eac_LastKey : dir;
     int err;
     const uint32_t sizes[] = {0, 8, 12, 16, 20, 32, 36, 40};
     control->eac_Entries = 0;
     if (pkt->dp_Arg4 < ED_NAME || pkt->dp_Arg4 > ED_OWNER) return ERROR_BAD_NUMBER;
     fixed = sizes[pkt->dp_Arg4];
-    while (!(err = ffs_next(&h->fs, dir, &it, &e))) {
-        if (!found) {
-            if (e.key == control->eac_LastKey) found = 1;
-            continue;
-        }
+    while (!(err = ffs_scan_next(&h->fs, dir, scan, previous, &e))) {
         memset(&item, 0, sizeof(item));
         item.ed_Name = (STRPTR)e.name; item.ed_Type = e.type;
         item.ed_Size = e.size; item.ed_Prot = e.protection;
@@ -915,12 +911,15 @@ static int examine_all(struct handler *h, uint32_t dir, struct DosPacket *pkt)
         item.ed_OwnerUID = (UWORD)(e.owner >> 16); item.ed_OwnerGID = (UWORD)e.owner;
         if ((control->eac_MatchString && !MatchPatternNoCase(control->eac_MatchString, item.ed_Name)) ||
             (control->eac_MatchFunc && !call_match(h, control->eac_MatchFunc, &pkt->dp_Arg4, &item))) {
-            control->eac_LastKey = e.key; continue;
+            control->eac_LastKey = previous = e.key; continue;
         }
         names = (uint32_t)strlen((char *)e.name) + 1;
         comments = pkt->dp_Arg4 >= ED_COMMENT ? (uint32_t)strlen((char *)e.comment) + 1 : 0;
         need = (fixed + names + comments + 3) & ~3u;
-        if (need > left) return control->eac_Entries ? 0 : ERROR_NO_FREE_STORE;
+        if (need > left) {
+            ffs_scan_again(scan, previous);
+            return control->eac_Entries ? 0 : ERROR_NO_FREE_STORE;
+        }
         dest = (void *)out;
         item.ed_Name = (STRPTR)(out + fixed);
         item.ed_Comment = comments ? (STRPTR)(out + fixed + names) : NULL;
@@ -928,7 +927,7 @@ static int examine_all(struct handler *h, uint32_t dir, struct DosPacket *pkt)
         if (comments) memcpy(out + fixed + names, e.comment, comments);
         if (last) last->ed_Next = dest;
         last = dest; out += need; left -= need;
-        control->eac_LastKey = e.key; ++control->eac_Entries;
+        control->eac_LastKey = previous = e.key; ++control->eac_Entries;
     }
     return err;
 }
@@ -1135,13 +1134,21 @@ static void dispatch(struct handler *h, struct DosPacket *pkt)
         result = !err && key == other ? LOCK_SAME : LOCK_SAME_VOLUME;
         break;
     }
-    case ACTION_EXAMINE_ALL:
+    case ACTION_EXAMINE_ALL: {
+        /* Without a lock there is nowhere to keep a scan between packets. */
+        struct file_lock *dirlock = pkt->dp_Arg1 ? get_lock(h, pkt->dp_Arg1) : NULL;
+        struct ffs_scan scan = {0};
         err = lock_key(h, pkt->dp_Arg1, &key);
-        if (!err) err = examine_all(h, key, pkt);
+        if (!err) err = examine_all(h, key, dirlock ? &dirlock->scan : &scan, pkt);
+        ffs_scan_end(&h->fs, &scan);
         break;
-    case ACTION_EXAMINE_ALL_END:
+    }
+    case ACTION_EXAMINE_ALL_END: {
+        struct file_lock *dirlock = pkt->dp_Arg1 ? get_lock(h, pkt->dp_Arg1) : NULL;
+        if (dirlock) ffs_scan_end(&h->fs, &dirlock->scan);
         ((struct ExAllControl *)pkt->dp_Arg5)->eac_LastKey = 0;
         break;
+    }
     case ACTION_EXAMINE_OBJECT:
     case ACTION_EXAMINE_FH:
         if (pkt->dp_Type == ACTION_EXAMINE_FH) {
@@ -1155,41 +1162,12 @@ static void dispatch(struct handler *h, struct DosPacket *pkt)
     case ACTION_EXAMINE_NEXT: {
         struct FileInfoBlock *fib = BADDR(pkt->dp_Arg2);
         struct file_lock *dirlock = pkt->dp_Arg1 ? get_lock(h, pkt->dp_Arg1) : NULL;
-        struct ffs_iterator scan = {0, 0, 0, 0}, *it = &scan;
-        uint32_t previous = fib->fib_DiskKey;
+        struct ffs_scan scan = {0};
         key = dirlock ? (uint32_t)dirlock->dos.fl_Key : h->fs.root;
         if (pkt->dp_Arg1 && !dirlock) err = ERROR_INVALID_LOCK;
-        else if (h->fs.format.dircache) {
-            /* The lock's cursor advances in place while it stays valid. */
-            if (dirlock) {
-                it = &dirlock->iterator;
-                if (dirlock->previous != previous || previous == key ||
-                    dirlock->generation != h->fs.generation) {
-                    memset(it, 0, sizeof(*it));
-                    dirlock->generation = h->fs.generation;
-                    if (previous != key) {
-                        do { err = ffs_next(&h->fs, key, it, &entry); }
-                        while (!err && entry.key != previous);
-                    }
-                }
-            } else if (previous != key) {
-                do { err = ffs_next(&h->fs, key, it, &entry); }
-                while (!err && entry.key != previous);
-            }
-            if (!err) err = ffs_next(&h->fs, key, it, &entry);
-            if (dirlock) dirlock->previous = err ? key : entry.key;
-        } else {
-            if (previous != key) {
-                uint16_t bucket;
-                err = ffs_stat(&h->fs, previous, &entry);
-                if (!err && entry.parent != key) err = ERROR_NO_MORE_ENTRIES;
-                if (!err && ffs_name_hash(entry.name, strlen((char *)entry.name),
-                        h->fs.format.international, (uint16_t)h->fs.buckets, &bucket))
-                    err = ERROR_NOT_A_DOS_DISK;
-                if (!err) { scan.bucket = bucket + 1; scan.next = entry.hash_next; }
-            }
-            if (!err) err = ffs_next(&h->fs, key, &scan, &entry);
-        }
+        else err = ffs_scan_next(&h->fs, key, dirlock ? &dirlock->scan : &scan,
+                                 fib->fib_DiskKey, &entry);
+        ffs_scan_end(&h->fs, &scan);
         if (!err) fill_fib(&entry, fib);
         break;
     }

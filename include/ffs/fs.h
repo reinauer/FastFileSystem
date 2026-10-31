@@ -96,6 +96,17 @@ struct ffs_entry {
 };
 /* The iterator is invalidated by directory mutations. */
 struct ffs_iterator { uint32_t bucket, next, visited, index; };
+/* A scan for ExNext and ExAll, which outlives changes to the volume: the
+ * caller may move or delete what it has been given. Until a change the
+ * iterator runs and keys collects what it returned. A change voids the
+ * iterator, so the scan is fixed: the keys still to return follow those. */
+struct ffs_scan {
+    struct ffs_iterator it, before;
+    uint32_t *keys;
+    uint32_t capacity, count, position, generation, previous;
+    unsigned fixed;
+    int status;
+};
 #ifdef FFS_PROFILE
 uint32_t ffs_profile_start(struct ffs_volume *);
 void ffs_profile_end(struct ffs_volume *, unsigned, uint32_t);
@@ -126,6 +137,14 @@ int ffs_resolve_create(struct ffs_volume *, uint32_t directory, const char *,
                        struct ffs_entry *, unsigned *created);
 int ffs_next(struct ffs_volume *, uint32_t directory,
              struct ffs_iterator *, struct ffs_entry *);
+/* Return the entry after key previous, or the first if previous is the
+ * directory. Any entry may be resumed from, but only the one the scan last
+ * returned is resumed from without rereading the directory. */
+int ffs_scan_next(struct ffs_volume *, uint32_t directory, struct ffs_scan *,
+                  uint32_t previous, struct ffs_entry *);
+/* Have the next call return the last entry again, after previous. */
+void ffs_scan_again(struct ffs_scan *, uint32_t previous);
+void ffs_scan_end(struct ffs_volume *, struct ffs_scan *);
 int ffs_read(struct ffs_volume *, uint32_t key, uint32_t offset, void *,
              uint32_t length, uint32_t *actual);
 int ffs_create(struct ffs_volume *, uint32_t directory, const char *name,
