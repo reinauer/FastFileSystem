@@ -1131,7 +1131,9 @@ static void dispatch(struct handler *h, struct DosPacket *pkt)
         uint32_t other;
         err = lock_key(h, pkt->dp_Arg1, &key);
         if (!err) err = lock_key(h, pkt->dp_Arg2, &other);
-        result = !err && key == other ? LOCK_SAME : LOCK_SAME_VOLUME;
+        /* The packet answers a boolean; SameLock() maps it to LOCK_SAME
+         * or LOCK_SAME_VOLUME itself. */
+        result = !err && key == other ? DOSTRUE : DOSFALSE;
         break;
     }
     case ACTION_EXAMINE_ALL: {
